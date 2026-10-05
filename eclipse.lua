@@ -1896,7 +1896,7 @@ do
     --   unregistered / death - 0 (не учат: причина не в выборе хитбокса). Попадание - 1.0.
     --   Понижающие множители: тип AA цели неуверен (< 50%) x0.7, тип AA цели сменился < 2 с назад x0.5,
     --   глубокий backtrack (> 6 тиков) x0.7, ты стрелял в прыжке x0.8.
-    -- базовые веса причин промаха - в CFG.attr (меряются по журналу: /eclipse attr)
+    -- базовые веса причин промаха - в CFG.attr (меняются: /eclipse cfg attr.<имя> <значение>)
     local ATTR_KEY = { correction = "correction", misprediction = "misprediction", ["prediction error"] = "prediction_error" }
     ST.ATTR_KEY = ATTR_KEY
     function ST.attr_w(state)
