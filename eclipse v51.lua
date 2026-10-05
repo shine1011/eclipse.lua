@@ -496,7 +496,7 @@ do
             o2.save = false
             return add(key, g:switch(name_, false), o2, "bind")
         end
-        function G.button(name_, fn, o) local b = g:button(name_); if b and fn then pcall(b.set_callback, b, fn) end; return b end
+        function G.button(name_, fn) local b = g:button(name_); if b and fn then pcall(b.set_callback, b, fn) end; return b end
         function G.label(name_) return g:label(name_) end
         return G
     end
@@ -537,7 +537,6 @@ end
 ---------------------------------------------------------------- world: общий кэш на тик
 -- RAP.W: me, alive, weapon, widx, wsub (вкладка рагебота), wgroup, state, vel, enemies, threat, charge, ping, now
 do
-    local U = RAP.U
     local W = { enemies = {}, now = 0 }
     RAP.W = W
     local WG = { [40] = "Scout", [9] = "AWP", [11] = "Auto", [38] = "Auto", [1] = "Deagle", [64] = "Revolver" }
@@ -1229,7 +1228,6 @@ end
 --   aa { type, sub, conf, prev, changed_at, width }  hist { shots, hits, miss = { reason = n }, head_miss, streak }
 --   threat { weapon, scoped, can_hit }  learn { arm, state, conf, samples, why, next }
 do
-    local U = RAP.U
     local TC = {}
     RAP.TC = TC
     local function new(en)
@@ -1483,14 +1481,14 @@ do
     end, 10)
     -- сырая оценка по окну: тип, подтип (быстрый / медленный jitter), уверенность
     local function raw(a)
-        local n = #a.f
-        if n < 8 then return nil end
+        local cnt = #a.f
+        if cnt < 8 then return nil end
         local fl, sm = 0, 0
-        for i = 1, n do fl, sm = fl + a.f[i], sm + a.m[i] end
+        for i = 1, cnt do fl, sm = fl + a.f[i], sm + a.m[i] end
         local K = RAP.CFG.aat
-        local width = sm / n
+        local width = sm / cnt
         if fl >= K.jitter_flips then
-            local rate = fl / n
+            local rate = fl / cnt
             return "jitter", rate >= 0.5 and "fast jitter" or "slow jitter", U.clamp((fl - K.jitter_flips + 2) / (K.jitter_flips + 2), 0.3, 1), width
         end
         if width >= K.wide then return "wide", fl >= 2 and "unstable wide" or "wide", U.clamp((width - K.wide) / 15 + 0.5, 0.3, 1), width end
@@ -1752,7 +1750,8 @@ do
         t.pconf = beaten and 0 or pmin
         t.conf = mc
         t.samples = samples(t.key)
-        if t.state == "RELEARNING" and t.relearn > 0 then
+        if t.state == "RELEARNING" and t.relearn > 0 then  -- RELEARNING держится, пока не сделаны relearn_shots выстрелов
+            t.state = "RELEARNING"
         elseif t.samples < 0.5 then t.state = "UNKNOWN"
         elseif not beaten and t.pconf >= c.confident_p and t.n >= c.min_samples then t.state = "CONFIDENT"
         elseif t.state ~= "FAILED" then t.state = "PROBING" end
@@ -1991,11 +1990,11 @@ do
         table.sort(keys, function(a, b) return a[2] > b[2] end)
         for i = 1, U.min(6, #keys) do
             local k = keys[i][1]
-            local pid, wg, aat = k:match("^(.-)|(.-)|(.*)$")
+            local _, wg, aat = k:match("^(.-)|(.-)|(.*)$")
             print(string.format("[strategy] %s", k))
             for a = 1, #ARMS do
                 local x = ST.ctx[k].arms[a]
-                local m, _, n = ST.post(k, a, wg, aat)
+                local m = ST.post(k, a, wg, aat)
                 if x.att > 0 or a == 1 then
                     print(string.format("[strategy]   %-16s est %3.0f%%  shots %d  hit %d (head %d, body %d)  corr %d  mispred %d  pred %d",
                         ARMS[a], m * 100, x.att, x.hits, x.hh, x.bh, x.corr, x.mis, x.pe))
@@ -2459,7 +2458,7 @@ do
     end
 
     local WAYS = { -90, -45, 180, 45, 90 }
-    local function defensive(c, flip, cmd)
+    local function defensive(c, flip)
         local dp, dy, t, n = c.def_pitch, c.def_yaw, globals.curtime, S.sent
         if dp and dp ~= "Off" then
             local v
@@ -2721,7 +2720,7 @@ do
         if want or peek_def then
             pcall(function() cmd.force_defensive = true end)
             set("hidden", c.defensive and true or false)
-            if c.defensive then defensive(c, flip, cmd) end
+            if c.defensive then defensive(c, flip) end
             AA.def = now
         else
             set("hidden", false)
@@ -3475,7 +3474,7 @@ do
         update_champs(min_n)
         local worst, wp = nil, 0
         for _, i in ipairs(E.slots) do
-            if E.fail[i] then worst, wp = i, 2; break end        -- проиграл A/B эталону - в первую очередь
+            if E.fail[i] then worst = i; break end        -- проиграл A/B эталону - в первую очередь
             if (E.trial[i] or 0) <= 0 then
                 local _, pw, n = E.score(E.home[i], i)
                 if n >= min_n and pw >= 0.8 and pw > wp then worst, wp = i, pw end
@@ -4279,7 +4278,6 @@ do
 end
 ---------------------------------------------------------------- debug panel: почему скрипт принял решение по текущей цели
 do
-    local U = RAP.U
     local D = { t = -1, rows = {} }
     local WARN, GOOD, DIM = color(255, 170, 110), color(150, 230, 150), color(170, 170, 185)
     local SCOL = { UNKNOWN = DIM, PROBING = color(240, 210, 120), CONFIDENT = GOOD, FAILED = color(255, 110, 110), RELEARNING = WARN }
@@ -4920,7 +4918,7 @@ do
         if t.dormant or (tr and tr.entity == t.ent) then return dmg end
         return 0
     end
-    local function targets(me)
+    local function targets()
         local now, eye = globals.curtime, RAP.W.eye
         local okv, va = pcall(render.camera_angles)
         local fy = okv and va and va.y or nil
@@ -5050,7 +5048,7 @@ do
             if clip < 0 then PK.reason = "not a gun"; return end
             if RAP.v("peek.scope") and SNIPER[W.widx] and not me.m_bIsScoped then PK.reason = "scope first"; return end
             if ST.need_dt and (W.charge or 0) < 1 then PK.reason = "AI: wait for DT (died on recent peeks)"; return end
-            local tl = targets(me)
+            local tl = targets()
             if #tl == 0 then PK.reason = "no target"; return end
             local vis, hid = {}, {}
             for _, t in ipairs(tl) do if t.dormant then hid[#hid + 1] = t else vis[#vis + 1] = t end end
@@ -5252,7 +5250,7 @@ do
     end)
     -- события попаданий / промахов (вверху слева)
     local EV = {}
-    RAP.on("our_ack", "events", function(rec, e)
+    RAP.on("our_ack", "events", function(_, e)
         if not RAP.v("misc.events") then return end
         local name = e.target and e.target:get_name() or "?"
         local txt = e.state == nil and string.format("Hit %s for %d", name, e.damage or 0) or string.format("Missed %s (%s)", name, tostring(e.state))
@@ -5896,7 +5894,7 @@ do
     -- health: модули, ошибки, хуки
     RAP.cmd.health = function()
         local total = 0
-        for phase, list in pairs(RAP.hooks) do total = total + #list end
+        for _, list in pairs(RAP.hooks) do total = total + #list end
         print(string.format("[health] %s | hooks: %d | ragebot items found: %d tabs", RAP.VERSION, total, RAP.ref.tabs.min_damage or 0))
         local any = false
         for k, e in pairs(U.errors) do any = true; print(string.format("[health] ERROR %-28s x%d  last: %s", k, e.n, tostring(e.msg):sub(1, 90))) end
