@@ -61,7 +61,8 @@ end
 do
     -- Защита данных: поврежденная запись -> резервная копия (последняя успешно прочитанная версия прошлой сессии),
     -- запись больше LIMIT отклоняется (база не раздувается), первая запись за сессию сохраняет старое значение в <key>_bak.
-    local S = { raw = {}, bak_done = {}, LIMIT = 768 * 1024, corrupted = {}, rejected = {} }
+    -- near: ключи больше 75% лимита (предупреждение в selftest до того, как запись начнут отклонять)
+    local S = { raw = {}, bak_done = {}, LIMIT = 768 * 1024, corrupted = {}, rejected = {}, near = {}, warned = {} }
     local function parse(raw)
         if type(raw) ~= "string" or raw == "" then return nil end
         local ok, v = pcall(json.parse, raw)
@@ -90,8 +91,12 @@ do
             if #s > S.LIMIT then
                 S.rejected[key] = #s
                 print(string.format("[eclipse] db '%s' not saved: %.0f KB is over the %.0f KB limit", key, #s / 1024, S.LIMIT / 1024))
+                -- раньше только print: обучение молча переставало сохраняться
+                if not S.warned[key] and RAP.toast then S.warned[key] = true; RAP.toast("Learning NOT saved: " .. key .. " is too big (/eclipse selftest)") end
                 return
             end
+            S.rejected[key] = nil
+            S.near[key] = #s > S.LIMIT * 0.75 and #s or nil
             if not S.bak_done[key] and S.raw[key] then db[key .. "_bak"] = S.raw[key] end
             S.bak_done[key] = true
             db[key] = s
@@ -1945,6 +1950,20 @@ do
         if #list > 300 then
             table.sort(list, function(a, b) return a[2] > b[2] end)
             for i = 301, #list do ST.ctx[list[i][1]] = nil end
+        end
+        -- v52: corr (correction-промахи по врагу) рос без ограничения по всем встреченным игрокам - держим только
+        -- врагов, у которых остался контекст; дробные счетчики - 3 знака (база ~25% меньше, лимит 768 KB дальше)
+        local live = {}
+        for k, e in pairs(ST.ctx) do
+            local pid = k:match("^(.-)|")
+            if pid then live[pid] = true end
+            for a = 1, #ARMS do
+                local x = e.arms[a]
+                x.h, x.m, x.w2 = U.round(x.h * 1000) / 1000, U.round(x.m * 1000) / 1000, U.round(x.w2 * 1000) / 1000
+            end
+        end
+        for pid, v in pairs(ST.corr) do
+            if not live[pid] then ST.corr[pid] = nil else ST.corr[pid] = U.round(v * 100) / 100 end
         end
         RAP.store.set(KEY, { ctx = ST.ctx, pop = ST.pop, corr = ST.corr })
     end)
@@ -5387,6 +5406,9 @@ do
             local rej = {}
             for k, v in pairs(S.rejected or {}) do rej[#rej + 1] = string.format("%s %.0f KB", k, v / 1024) end
             warn("db size limit", #rej == 0, #rej > 0 and ("not saved: " .. table.concat(rej, ", ")) or nil)
+            local near = {}
+            for k, v in pairs(S.near or {}) do near[#near + 1] = string.format("%s %.0f KB", k, v / 1024) end
+            warn("db size headroom (< 75% of limit)", #near == 0, #near > 0 and table.concat(near, ", ") or nil)
         end
         -- память: размеры таблиц, которые растут по ходу игры
         do
