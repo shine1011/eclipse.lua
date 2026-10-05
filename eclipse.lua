@@ -54,6 +54,11 @@ do
         return ok, err
     end
     function U.log(tag, fmt, ...) print(string.format("[%s] " .. fmt, tag, ...)) end
+    -- поле объекта чита под pcall без замыкания: pcall(U.getf, obj, k) / pcall(U.setf, obj, k, v)
+    function U.getf(o, k) return o[k] end
+    function U.setf(o, k, v) o[k] = v end
+    -- текущее значение hitchance на вкладке текущего оружия (для базы adaptive / lag hc)
+    function U.hc_cur() local P = RAP.ref.rage.hitchance; return P and P.cur():get() end
     RAP.U = U
 end
 
@@ -2078,7 +2083,7 @@ do
             if not base_hc then
                 -- база - твое значение на вкладке текущего оружия (у каждой вкладки свое, общее значение путало оружия)
                 local wkey = RAP.W.wsub or "Global"
-                local ok, cur = pcall(function() return RAP.ref.rage.hitchance and RAP.ref.rage.hitchance.cur():get() end)
+                local ok, cur = pcall(U.hc_cur)
                 if RAP.arb.owned.hitchance then cur = nil end      -- свое значение не берем за базу
                 if ok and type(cur) == "number" then V.base_seen[wkey] = cur end
                 base_hc = V.base_seen[wkey]
@@ -2375,7 +2380,7 @@ do
     local U = RAP.U
     local set = RAP.aaset
     local S = { sent = 0, flip = false, left = 1, cycle = false, manual = 0, brute_until = 0, brute_flip = false,
-        brute_shift = 0, lim_until = 0, def_until = 0, prev_hit = false, fh = {}, prev = {}, ro = 0, mod_rand = 0, flick_base = 0 }
+        brute_shift = 0, lim_until = 0, def_until = 0, prev_hit = false, fh = {}, prev = {}, ro = 0, mod_rand = 0, flick_base = 0, names = {} }
     local AA = { S = S }
     RAP.aa = AA
     local GROUP = { stand = "stand", move = "move", slow = "slow", air = "air", airduck = "air", duck = "duck" }
@@ -2428,9 +2433,9 @@ do
         local cur = RAP.v(key) and true or false
         local prev = S.prev[key] or false
         S.prev[key] = cur
-        local name
-        pcall(function() name = it:name() end)
-        if RAP.binds.is_toggle(name) then return cur ~= prev end
+        local name = S.names[key]
+        if name == nil then local okn, nm = pcall(it.name, it); name = okn and nm or false; S.names[key] = name end
+        if RAP.binds.is_toggle(name or nil) then return cur ~= prev end
         return cur and not prev
     end
     local function update_manual()
@@ -2519,8 +2524,9 @@ do
     -- safe head: смотрим вниз-назад, когда враг ниже (преимущество по высоте) - голова прячется за телом
     local function safe_head()
         if not RAP.v("aa.safe_head") or not RAP.W.threat then return false end
-        local okd, dz = pcall(function() return RAP.W.eye.z - (RAP.W.threat:get_origin().z + 64) end)
-        if not okd then return false end
+        local okd, org = pcall(RAP.W.threat.get_origin, RAP.W.threat)
+        if not okd or not org or not RAP.W.eye then return false end
+        local dz = RAP.W.eye.z - (org.z + 64)
         local st = RAP.W.state
         if not ((dz > 22 and (st == "stand" or st == "duck")) or (dz > 65 and st == "airduck")) then return false end
         set("pitch", "Down"); set("yaw", "Backward"); set("base", "At Target"); set("offset", 0)
@@ -2640,10 +2646,9 @@ do
         local group = AA.group_of(W.state)
         -- легит AA на E: чит сам выключает AA, пока зажат IN_USE, поэтому кнопку снимаем
         -- (кроме случаев, когда E нужна игре: разминирование, заложник, дверь / предмет под прицелом)
-        local use = false
-        pcall(function() use = cmd.in_use end)
-        if use and RAP.v("aa.legit") and not use_needed(me, cmd) then
-            pcall(function() cmd.in_use = false end)
+        local oku, use = pcall(U.getf, cmd, "in_use")
+        if oku and use and RAP.v("aa.legit") and not use_needed(me, cmd) then
+            pcall(U.setf, cmd, "in_use", false)
             set("enabled", true); set("pitch", "Disabled")
             set("yaw", "Backward"); set("base", "Local View"); set("offset", 180)
             set("modifier", "Disabled"); set("mod_offset", 0)
@@ -2724,7 +2729,9 @@ do
         it_fs = it_fs or low
         local fs = (RAP.v("aa.fs") or it_fs) and S.manual == 0
         if fs and RAP.v("aa.fsfix") then
-            local ok, ta, tb = pcall(function() return rage.antiaim:get_target(), rage.antiaim:get_target(true) end)
+            local ok, ta = pcall(rage.antiaim.get_target, rage.antiaim)
+            local ok2, tb = pcall(rage.antiaim.get_target, rage.antiaim, true)
+            ok = ok and ok2
             local dd = (ok and ta and tb) and U.abs(U.norm(ta - tb)) or nil
             if S.fs_fix then
                 if now > S.fs_fix_until or (dd and dd > 15) then S.fs_fix = false end
@@ -2748,7 +2755,7 @@ do
         local want = c.defensive and S.manual == 0 and not fs
         if want and RAP.v("aa.def_smart") and not ((W.charge or 0) >= 1 and W.threat) then want = false end
         if want or peek_def then
-            pcall(function() cmd.force_defensive = true end)
+            pcall(U.setf, cmd, "force_defensive", true)
             set("hidden", c.defensive and true or false)
             if c.defensive then defensive(c, flip) end
             AA.def = now
@@ -4404,7 +4411,7 @@ do
     end)
     RAP.on("tick", "move lean", function(cmd)
         local sel = RAP.v("ab.list")
-        if type(sel) == "table" and U.has(sel, "Move lean") then pcall(function() cmd.animate_move_lean = true end) end
+        if type(sel) == "table" and U.has(sel, "Move lean") then pcall(U.setf, cmd, "animate_move_lean", true) end
     end, 95)
 end
 ---------------------------------------------------------------- lag records: состояние лагкомпа врагов
@@ -4470,7 +4477,7 @@ do
         -- база: твое значение, пока арбитр им не владеет (иначе - последнее увиденное). Раньше при владении голос
         -- пропускался -> арбитр снимал override -> на следующем тике голос снова был: hitchance мигал каждый тик.
         local wkey = RAP.W.wsub or "Global"
-        local ok, cur = pcall(function() return RAP.ref.rage.hitchance.cur():get() end)
+        local ok, cur = pcall(U.hc_cur)
         if ok and type(cur) == "number" and not RAP.arb.owned.hitchance then L.base_seen[wkey] = cur end
         if add ~= 0 then
             -- поверх голоса с меньшим приоритетом (adaptive / оружие), а не вместо него
@@ -4581,6 +4588,28 @@ do
         return ok and res
     end
 
+    -- no fall damage / быстрая лестница (функция модуля: раньше замыкание создавалось каждый тик)
+    -- trace_line: skip = me явно (в документации не указан пропуск по умолчанию для trace_line)
+    local function move_helpers(me, cmd, W)
+        local org = me:get_origin()
+        if W.vel and W.vel.z <= -500 then
+            if utils.trace_line(org, org - vector(0, 0, 15), me).fraction ~= 1 then cmd.in_duck = false
+            elseif utils.trace_line(org, org - vector(0, 0, 50), me).fraction ~= 1 then cmd.in_duck = true end
+        end
+        if me.m_MoveType == 9 and cmd.forwardmove ~= 0 then
+            local fwd = cmd.forwardmove > 0
+            if not fwd or cmd.view_angles.x < 45 then
+                local va = cmd.view_angles
+                va.x = 89
+                cmd.in_moveright, cmd.in_moveleft = fwd, not fwd
+                cmd.in_forward, cmd.in_back = not fwd, fwd
+                local sm = fwd and cmd.sidemove or -cmd.sidemove
+                va.y = va.y + (sm == 0 and 90 or (sm < 0 and 150 or 30))
+                cmd.view_angles = va
+            end
+        end
+    end
+
     RAP.on("tick", "exploits", function(cmd)
         local W = RAP.W
         if not W.alive then return end
@@ -4605,7 +4634,7 @@ do
         -- air teleport
         if RAP.v("it.at") and charged and (not on_ground) and globals.tickcount % U.max(1, RAP.v("it.at_int") or 12) == 0 then
             if not RAP.v("it.at_vis") or hittable_after_jump(me) then
-                pcall(function() cmd.force_defensive = true end)
+                pcall(U.setf, cmd, "force_defensive", true)
                 pcall(rage.exploit.force_teleport, rage.exploit)
             end
         end
@@ -4621,8 +4650,8 @@ do
         local brk = false
         if RAP.v("ex.brk") then
             local excl = (RAP.v("ex.brk_rev") and widx == 64) or (RAP.v("ex.brk_nade") and widx and widx >= 43 and widx <= 48)
-            local reload = false
-            pcall(function() reload = (W.weapon.m_bInReload or false) end)
+            local okr, rl = pcall(U.getf, W.weapon, "m_bInReload")
+            local reload = okr and rl and true or false
             local def_t = RAP.aa.def
             brk = not excl and (until_ok(now, S.brk_until, 0.25) or (until_ok(now, S.flinch_until, 0.3) and U.has(trig, "Flinch"))
                 or (until_ok(now, S.flash_until, 10) and U.has(trig, "Flashed")) or (def_t and now >= def_t and now - def_t < 0.12 and U.has(trig, "Defensive"))
@@ -4681,25 +4710,7 @@ do
         end
         -- movement helpers
         if RAP.v("ex.move") then
-            U.safe("move helpers", function()
-                local org = me:get_origin()
-                if W.vel and W.vel.z <= -500 then
-                    if utils.trace_line(org, org - vector(0, 0, 15)).fraction ~= 1 then cmd.in_duck = false
-                    elseif utils.trace_line(org, org - vector(0, 0, 50)).fraction ~= 1 then cmd.in_duck = true end
-                end
-                if me.m_MoveType == 9 and cmd.forwardmove ~= 0 then
-                    local fwd = cmd.forwardmove > 0
-                    if not fwd or cmd.view_angles.x < 45 then
-                        local va = cmd.view_angles
-                        va.x = 89
-                        cmd.in_moveright, cmd.in_moveleft = fwd, not fwd
-                        cmd.in_forward, cmd.in_back = not fwd, fwd
-                        local sm = fwd and cmd.sidemove or -cmd.sidemove
-                        va.y = va.y + (sm == 0 and 90 or (sm < 0 and 150 or 30))
-                        cmd.view_angles = va
-                    end
-                end
-            end)
+            U.safe("move helpers", move_helpers, me, cmd, W)
         end
     end, 45)
     RAP.on("shutdown", "exploits", function() if pred_on then pred_apply(PRED_DEF) end end)
@@ -4875,8 +4886,8 @@ do
         danger = {}, dorm_age = 6, dorm_off = 0 }
     local SEEN = {}
     RAP.peek = { PK = PK, ST = ST }
-    local function setf(cmd, k, v) pcall(function() cmd[k] = v end) end
-    local function getf(cmd, k) local ok, v = pcall(function() return cmd[k] end); return ok and v or nil end
+    local function setf(cmd, k, v) pcall(U.setf, cmd, k, v) end
+    local function getf(cmd, k) local ok, v = pcall(U.getf, cmd, k); return ok and v or nil end
 
     local function push(kind)
         ST.n = ST.n + 1
@@ -4997,7 +5008,7 @@ do
             for k = 0, n - 1 do
                 local ang = U.norm(base + 90 + k * 360 / n)
                 va.y = ang
-                pcall(function() cmd.view_angles = va end)
+                pcall(U.setf, cmd, "view_angles", va)
                 local sim
                 if still then local oks, s1 = pcall(me.simulate_movement, me, nil, vector(), 1); sim = oks and s1 or nil end
                 sim = sim or me:simulate_movement()
@@ -5035,7 +5046,7 @@ do
             end
         end)
         va.y = y0
-        pcall(function() cmd.view_angles = va end)
+        pcall(U.setf, cmd, "view_angles", va)
         for k, v in pairs(saved) do setf(cmd, k, v) end
         if not ok then error(err, 0) end
         if best then return best end
