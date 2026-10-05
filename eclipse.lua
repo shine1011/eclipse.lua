@@ -3083,6 +3083,7 @@ do
     end
     -- установка профиля группы: время включения нужно для минимального срока жизни и кулдауна
     AI.how = {}
+    local NOT_VERIFIED = { ["back to best"] = true, ["removed from pool"] = true, exploration = true, ["evo trial"] = true }
     function AI.set(g, i, how, why)
         local old = AI.cur[g]
         AI.cur[g], AI.how[g] = i, how or "best"
@@ -3090,8 +3091,10 @@ do
             local now = globals.curtime
             AI.since[g] = now
             if old then AI.last_switch[g] = now end
-            -- журнал решений: смена профиля проверяется по уворотам после нее (evo - не здесь, у него свой A/B)
-            if old and why and how ~= "evo" then
+            -- журнал решений: смена профиля проверяется по уворотам после нее. Не проверяются временные и вынужденные
+            -- смены: evo (свой A/B), эксперимент на раунд и возврат к лучшему после него, замена убранного из пула.
+            -- v57: в игре эксперименты каждого раунда закрывали все решения как SUPERSEDED до первого вердикта.
+            if old and why and NOT_VERIFIED[why] == nil and how ~= "evo" and how ~= "explore" then
                 local pid = RAP.W.threat and RAP.W.pid(RAP.W.threat)
                 local pm, pv = AI.post(g, old, pid)
                 RAP.dl.record("aa", g, old, i, why, { pre_m = pm, pre_v = pv, lf = P[old].name, lt = P[i].name })

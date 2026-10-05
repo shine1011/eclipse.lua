@@ -97,6 +97,19 @@ test("decisions: AA profile rollback, better verdict, pool guard", function()
     assert(DL.rb.aa({ key = "move", from = 9, to = 12, lt = "x" }) == false, "rollback to a removed profile")
 end)
 
+test("decisions: per-round exploration / back to best are not verified decisions", function()
+    local E = S.load(PATH)
+    local AI, DL = E.RAP.ai, E.RAP.dl
+    AI.cur.stand = 9
+    AI.set("stand", 10, "best", "62% vs 50%, confident 85% better")
+    assert(DL.open["aa|stand"], "real decision not recorded")
+    AI.set("stand", 11, "explore", "exploration")
+    AI.set("stand", 10, "best", "back to best")
+    AI.set("stand", 12, "best", "removed from pool")
+    local d = DL.open["aa|stand"]
+    assert(d and d.to == 10 and d.why:find("confident"), "real decision was superseded by a temporary switch")
+end)
+
 test("decisions: phase shift that makes the enemy hit more is rolled back", function()
     local E = S.load(PATH)
     local RAP = E.RAP
