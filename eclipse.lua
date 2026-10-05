@@ -191,7 +191,8 @@ do
         },
         shots = { near = 60, inacc_drop = 0.4 },
         peek = { scan_ms = 1.5 },
-        aa_ai = { explore_far = 1500, peek_speed = 100 },   -- v58: эксперимент / Evo-испытание только против врага дальше этого и когда ты не пикаешь        -- AI Peek: время скана за тик (мс), остаток направлений - на следующих тиках
+        aa_ai = { explore_far = 1500, peek_speed = 100,
+            safe_head_dz = 45 },  -- v59: safe head только при реальном перепаде высоты (было 22 - ступенька / ящик)   -- v58: эксперимент / Evo-испытание только против врага дальше этого и когда ты не пикаешь        -- AI Peek: время скана за тик (мс), остаток направлений - на следующих тиках
         dormant = { hit_radius = 16 },   -- радиус (юниты) вокруг точки, попадание в который считается попаданием (оценка HC)
         log = { keep = 600 },      -- выстрелов в журнале (для сравнения версий)
         db = { schema = 50 },
@@ -1456,6 +1457,8 @@ do
                     brute = AA.brute and 1 or 0, man = AA.manual or 0, spd = W.vel and U.round(W.vel:length2d()) or 0,
                     how = (AA.guard and "guarded->best") or (RAP.ai and AA.group and RAP.ai.how[AA.group]) or "-", fs = AA.fs and 1 or 0,
                     peek = (W.vel and W.vel:length2d() > 100) and 1 or 0,
+                    aam = (AA.safe and "safe head") or (AA.mode == "legit" and "legit") or ((AA.manual or 0) ~= 0 and "manual")
+                        or (AA.fs and "freestand") or (AA.low and "low hp") or "profile",
                     dist = tc and tc.geo.dist and U.round(tc.geo.dist) or nil, eaat = tc and tc.aa.type or "?" }
                 DU.deaths[#DU.deaths + 1] = row
                 if #DU.deaths > 150 then table.remove(DU.deaths, 1) end
@@ -1514,7 +1517,7 @@ do
         U.log("deaths", "%d deaths: headshot %.0f%% | defensive active %.0f%% | DT charged %.0f%%", #rows, hs / #rows * 100, def / #rows * 100, dt / #rows * 100)
         cut(rows, "prof", "AA profile:"); cut(rows, "st", "your state:"); cut(rows, "side", "desync side:")
         cut(rows, "w", "enemy weapon:"); cut(rows, "eaat", "enemy AA:")
-        cut(rows, "how", "profile pick:"); cut(rows, "fs", "freestanding:"); cut(rows, "peek", "you peeking:")
+        cut(rows, "aam", "AA mode:"); cut(rows, "how", "profile pick:"); cut(rows, "fs", "freestanding:"); cut(rows, "peek", "you peeking:")
     end
     RAP.cmd.deaths = function() DU.deaths_report() end
 end
@@ -2808,17 +2811,24 @@ do
     end
 
     -- safe head: смотрим вниз-назад, когда враг ниже (преимущество по высоте) - голова прячется за телом
-    local function safe_head()
-        if not RAP.v("aa.safe_head") or not RAP.W.threat then return false end
-        local okd, org = pcall(RAP.W.threat.get_origin, RAP.W.threat)
-        if not okd or not org or not RAP.W.eye then return false end
-        local dz = RAP.W.eye.z - (org.z + 64)
-        local st = RAP.W.state
-        if not ((dz > 22 and (st == "stand" or st == "duck")) or (dz > 65 and st == "airduck")) then return false end
+    -- v59: раньше safe head включался при перепаде 22 юнита против любой угрозы и ВЫКЛЮЧАЛ body yaw (десинка нет),
+    -- jitter, freestanding и defensive - голова стояла статично, любой резольвер попадал. Теперь: только против врага,
+    -- который может попасть, при перепаде >= CFG.aa_ai.safe_head_dz; десинк остается (статичный, сторона профиля),
+    -- defensive on peek работает как обычно.
+    local function safe_head(flip)
+        local W = RAP.W
+        if not RAP.v("aa.safe_head") or not W.can_hit_me then return false end
+        local okd, org = pcall(W.can_hit_me.get_origin, W.can_hit_me)
+        if not okd or not org or not W.eye then return false end
+        local dz = W.eye.z - (org.z + 64)
+        local st = W.state
+        local need = RAP.CFG.aa_ai.safe_head_dz or 45
+        if not ((dz > need and (st == "stand" or st == "duck")) or (dz > need + 40 and st == "airduck")) then return false end
         set("pitch", "Down"); set("yaw", "Backward"); set("base", "At Target"); set("offset", 0)
-        set("modifier", "Disabled"); set("mod_offset", 0); set("body", false); set("body_fs", "Off")
-        set("hidden", false); set("freestand", false)
-        pcall(rage.antiaim.inverter, rage.antiaim, false)
+        set("modifier", "Disabled"); set("mod_offset", 0)
+        set("body", true); set("left", 58); set("right", 58); set("body_opts", NO_OPTS); set("body_fs", "Off")
+        set("freestand", false)
+        pcall(rage.antiaim.inverter, rage.antiaim, flip and true or false)
         return true
     end
 
@@ -3058,8 +3068,7 @@ do
         set("avoid_bs", RAP.v("aa.avoid_bs") and true or nil)
         AA.fs = fs
         -- safe head
-        AA.safe = S.manual == 0 and safe_head()
-        if AA.safe then AA.mode = "safe head"; return end
+        AA.safe = S.manual == 0 and safe_head(flip)
         -- defensive: профиль + "defensive on peek"
         local can = W.can_hit_me ~= nil
         if RAP.v("aa.def_peek") and can and not S.prev_hit and (W.charge or 0) >= 1 then
@@ -3067,17 +3076,19 @@ do
         end
         S.prev_hit = can
         local peek_def = now < S.def_until
-        local want = c.defensive and S.manual == 0 and not fs
+        local want = c.defensive and S.manual == 0 and not fs and not AA.safe
         if want and RAP.v("aa.def_smart") and not ((W.charge or 0) >= 1 and W.threat) then want = false end
         if want or peek_def then
             pcall(U.setf, cmd, "force_defensive", true)
-            set("hidden", c.defensive and true or false)
-            if c.defensive then defensive(c, flip) end
+            -- в safe head - только сам defensive (сдвиг тика), без скрытых углов профиля: голова остается за телом
+            local hid = c.defensive and not AA.safe
+            set("hidden", hid and true or false)
+            if hid then defensive(c, flip) end
             AA.def = now
         else
             set("hidden", false)
         end
-        AA.mode = c.name
+        AA.mode = AA.safe and "safe head" or c.name
     end
     RAP.on("tick", "aa engine", run, 30)
     RAP.on("shutdown", "aa", function() RAP.aa_release() end)
@@ -4071,7 +4082,10 @@ do
         print(string.format("[why]  enemy AA: %s%s, classifier %s (%s)", c.aa_type, c.aa_sub and (" / " .. c.aa_sub) or "", pc(c.classifier), RAP.conf_level(c.classifier)))
         if c.st then
             local t, ST = c.st, RAP.strat
-            print(string.format("[why]  strategy: %s, %s, confidence %s (%s), %.0f samples", c.arm, c.state or "-", pc(c.strategy), RAP.conf_level(c.strategy), c.samples))
+            -- v59: при малом числе своих выстрелов уверенность берется из приора (популяция) - так и пишется
+            local prior_only = (c.samples or 0) < (RAP.CFG.strategy.min_samples or 2)
+            print(string.format("[why]  strategy: %s, %s, confidence %s (%s), %.0f samples%s", c.arm, c.state or "-", pc(c.strategy),
+                prior_only and "prior only - not enough own shots" or RAP.conf_level(c.strategy), c.samples, prior_only and " [estimate from other enemies]" or ""))
             print(string.format("[why]    why: %s | next: %s", tostring(c.why or "-"), tostring(c.next or "-")))
             local mc = ST.post(t.key, t.arm, t.wg, t.aat)
             local rej = {}

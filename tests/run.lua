@@ -471,6 +471,26 @@ test("AA: experiment / evo profile is replaced by the best one in a close duel, 
     no_errors(E)
 end)
 
+test("safe head keeps desync and needs a real height advantage against an enemy that can hit you", function()
+    local E = S.load(PATH)
+    local RAP = E.RAP
+    local ez = 0
+    local me = S.player({ idx = 1, get_player_weapon = function() return nil end, get_eye_position = function() return vec(0, 0, 64) end,
+        get_origin = function() return vec() end })
+    local enemy = S.player({ idx = 3, get_origin = function() return vec(600, 0, ez) end })
+    entity.get_local_player = function() return me end
+    entity.get_players = function(_, _, cb) cb(enemy) end
+    entity.get_threat = function() return enemy end
+    local function run() for _ = 1, 3 do E.T.tick = E.T.tick + 1; E.fire("createmove", { choked_commands = 0, view_angles = vec() }) end end
+    local body = RAP.ref.aa.body
+    ez = -30; run()                                     -- 30 юнитов выше: раньше включался safe head без десинка
+    assert(not RAP.aa.safe, "safe head on a small step")
+    ez = -80; run()
+    assert(RAP.aa.safe == true and RAP.aa.mode == "safe head", "no safe head on a real height advantage")
+    assert(body.ov == true, "safe head must keep body yaw (desync)")
+    no_errors(E)
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP
