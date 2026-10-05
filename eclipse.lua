@@ -67,7 +67,17 @@ do
     -- Защита данных: поврежденная запись -> резервная копия (последняя успешно прочитанная версия прошлой сессии),
     -- запись больше LIMIT отклоняется (база не раздувается), первая запись за сессию сохраняет старое значение в <key>_bak.
     -- near: ключи больше 75% лимита (предупреждение в selftest до того, как запись начнут отклонять)
-    local S = { raw = {}, bak_done = {}, LIMIT = 768 * 1024, corrupted = {}, rejected = {}, near = {}, warned = {} }
+    -- dirty: ключи, данные которых менялись с прошлой записи. Плановое сохранение (начало раунда / смерть) пишет
+    -- только их; при выгрузке и /eclipse save пишется все (force). io: статистика последнего сохранения.
+    local S = { raw = {}, bak_done = {}, LIMIT = 768 * 1024, corrupted = {}, rejected = {}, near = {}, warned = {}, dirty = {},
+        io = { n = 0, bytes = 0, ms = 0, skipped = 0 } }
+    function S.mark(key) S.dirty[key] = true end
+    -- нужно ли писать ключ в этом сохранении; false - пропуск (учитывается в статистике)
+    function S.need(key, force)
+        if force or S.dirty[key] then return true end
+        S.io.skipped = S.io.skipped + 1
+        return false
+    end
     local function parse(raw)
         if type(raw) ~= "string" or raw == "" then return nil end
         local ok, v = pcall(json.parse, raw)
@@ -102,6 +112,8 @@ do
             end
             S.rejected[key] = nil
             S.near[key] = #s > S.LIMIT * 0.75 and #s or nil
+            S.dirty[key] = nil
+            S.io.n, S.io.bytes = S.io.n + 1, S.io.bytes + #s
             if not S.bak_done[key] and S.raw[key] then db[key .. "_bak"] = S.raw[key] end
             S.bak_done[key] = true
             db[key] = s
@@ -878,6 +890,7 @@ do
         row.v, row.s = RAP.VERSION, T.session
         rows[#rows + 1] = row
         while #rows > RAP.CFG.log.keep do table.remove(rows, 1) end
+        RAP.store.mark(AKEY)
     end
     RAP.tele = T
     local function fresh()
@@ -904,11 +917,13 @@ do
         rows[#rows + 1] = row
         local keep = RAP.CFG.log.keep
         while #rows > keep do table.remove(rows, 1) end
+        RAP.store.mark(JKEY); RAP.store.mark(KEY)
     end)
     RAP.on("enemy_shot", "tele", function(kind, rec)
         local c = T.cur
         if kind == "hit" then c.ehits = c.ehits + 1; if rec.hitgroup == 1 then c.ehits_head = c.ehits_head + 1 end
         elseif kind == "dodge" then c.dodges = c.dodges + 1 end
+        RAP.store.mark(KEY)
     end)
     events.player_death:set(function(e)
         U.safe("tele death", function()
@@ -916,9 +931,10 @@ do
             if not me then return end
             if entity.get(e.attacker, true) == me and entity.get(e.userid, true) ~= me then T.cur.kills = T.cur.kills + 1 end
             if entity.get(e.userid, true) == me then T.cur.deaths = T.cur.deaths + 1; if e.headshot then T.cur.hs_deaths = T.cur.hs_deaths + 1 end end
+            RAP.store.mark(KEY)
         end)
     end)
-    RAP.on("round", "tele", function() T.cur.rounds = T.cur.rounds + 1; T.streak = {} end)
+    RAP.on("round", "tele", function() T.cur.rounds = T.cur.rounds + 1; T.streak = {}; RAP.store.mark(KEY) end)
     RAP.resets.journal = function() T.journal = { rows = {} } end
     RAP.resets.ajournal = function() T.ajournal = { rows = {} } end
     RAP.resets.reports = function() T.hist, T.cur.slot = { list = {} }, nil end
@@ -930,16 +946,17 @@ do
             dodge = (c.dodges + c.ehits) > 0 and c.dodges / (c.dodges + c.ehits) or nil, rounds = c.rounds, v = RAP.VERSION }
     end
     T.summary = summary
-    RAP.on("save", "tele", function()
+    RAP.on("save", "tele", function(force)
+        local S = RAP.store
         local s = summary(T.cur)
-        if s.shots >= 5 then
+        if s.shots >= 5 and S.need(KEY, force) then
             local list = T.hist.list
             if T.cur.slot then list[T.cur.slot] = s else list[#list + 1] = s; T.cur.slot = #list end
             while #list > 20 do table.remove(list, 1); T.cur.slot = #list end
-            RAP.store.set(KEY, T.hist)
+            S.set(KEY, T.hist)
         end
-        RAP.store.set(JKEY, T.journal)
-        RAP.store.set(AKEY, T.ajournal)
+        if S.need(JKEY, force) then S.set(JKEY, T.journal) end
+        if S.need(AKEY, force) then S.set(AKEY, T.ajournal) end
     end)
 
     local function pct(v) return v and string.format("%.0f%%", v * 100) or "-" end
@@ -1141,6 +1158,7 @@ do
     local function push(d)
         DL.log[#DL.log + 1] = d
         while #DL.log > 200 do table.remove(DL.log, 1) end
+        RAP.store.mark(KEY)
     end
     local function unixtime() local ok, t = pcall(common.get_unixtime); return ok and tonumber(t) or 0 end
     local function bkey(kind, key, opt) return kind .. "|" .. tostring(key) .. "|" .. tostring(opt) end
@@ -1227,7 +1245,8 @@ do
     end
     RAP.on("level", "decisions", function() DL.open, DL.stats = {}, {} end)
     RAP.resets.decisions = function() DL.log, DL.open, DL.stats, DL.block = {}, {}, {}, {} end
-    RAP.on("save", "decisions", function()
+    RAP.on("save", "decisions", function(force)
+        if not RAP.store.need(KEY, force) then return end
         local out = {}
         for _, d in ipairs(DL.log) do
             out[#out + 1] = { kind = d.kind, key = tostring(d.key), lf = d.lf, lt = d.lt, why = d.why, verdict = d.verdict, conf = d.conf,
@@ -1387,12 +1406,13 @@ do
                     dist = tc and tc.geo.dist and U.round(tc.geo.dist) or nil, eaat = tc and tc.aa.type or "?" }
                 DU.deaths[#DU.deaths + 1] = row
                 if #DU.deaths > 150 then table.remove(DU.deaths, 1) end
+                RAP.store.mark(KEY)
             elseif att == me then close(vic:get_index(), "won")
             else close(vic:get_index(), "apart") end
         end)
     end)
     RAP.on("round", "duels", function() for idx in pairs(DU.live) do close(idx, "apart") end end)
-    RAP.on("save", "duels", function() RAP.store.set(KEY, { list = DU.deaths }) end)
+    RAP.on("save", "duels", function(force) if RAP.store.need(KEY, force) then RAP.store.set(KEY, { list = DU.deaths }) end end)
     RAP.resets.deaths = function() DU.deaths = {} end
 
     local function median(t) if #t == 0 then return nil end; table.sort(t); return t[math.floor(#t / 2) + 1] end
@@ -1640,6 +1660,7 @@ do
                         local w = 0.5 ^ (age / hl)
                         for a = 1, #ARMS do local x = e.arms[a]; x.h, x.m, x.w2 = x.h * w, x.m * w, x.w2 * w * w end
                         e.dts = now
+                        RAP.store.mark(KEY)
                     end
                 end
             end
@@ -1898,6 +1919,7 @@ do
     end, 10)
     RAP.on("our_ack", "strategy", function(rec, e)
         local ok = e.state == nil
+        RAP.store.mark(KEY)
         if rec.pid then
             local cr = ST.corr[rec.pid] or 0
             if e.state == "correction" then cr = cr + 1 elseif ok then cr = U.max(0, cr - 0.5) end
@@ -1986,8 +2008,8 @@ do
     end
     RAP.on("level", "strategy", function() ST.T, ST.sess = {}, {} end)
     RAP.resets.strategy = function() ST.ctx, ST.pop, ST.corr, ST.sess, ST.T = {}, {}, {}, {}, {} end
-    RAP.on("save", "strategy", function()
-        if not RAP.v("main.persist") then return end
+    RAP.on("save", "strategy", function(force)
+        if not RAP.v("main.persist") or not RAP.store.need(KEY, force) then return end
         local list = {}
         for k, e in pairs(ST.ctx) do
             local pid = k:match("^(.-)|")
@@ -3062,6 +3084,7 @@ do
 
     local function dodge_value(dist) return 0.2 + 1.05 * U.clamp(1 - (dist or 60) / 60, 0, 1) end
     local function reward(g, i, pid, v, wgt)
+        RAP.store.mark(KEY)
         local gamma = (RAP.v("ai.memory") or 95) / 100
         local s = AI.st[g][i]
         s.n, s.sum = U.max(0.5, s.n * gamma) + 1, s.sum * gamma + v
@@ -3082,6 +3105,7 @@ do
     -- повторное переключение в течение 60 с требует уверенности 99%. Врага не видели 20+ минут - статистика заново.
     local function side_note(pid, flip, hit)
         if flip == nil or not pid or not RAP.W.learn(pid) then return end
+        RAP.store.mark(KEY)
         local s = AI.sm[pid]
         if not s then s = { h = { 0, 0 }, d = { 0, 0 }, inv = false }; AI.sm[pid] = s end
         local okt, ut = pcall(common.get_unixtime)
@@ -3155,6 +3179,7 @@ do
                 w0 = U.round(w0 * 100) / 100, aw = U.round(aw * 100) / 100, wc = rec.ctx.wc, d = rec.dist and U.round(rec.dist) or nil })
         end
         if aw <= 0 then return end
+        RAP.store.mark(KEY)
         AI.bd[g] = AI.bd[g] or {}
         bd_note(AI.bd[g], i, dodge, w)
         if rec.pid and RAP.W.learn(rec.pid) then
@@ -3251,8 +3276,8 @@ do
         if #l > cap then for k2 = cap + 1, #l do l[k2] = nil end end
         return l
     end
-    RAP.on("save", "ai", function()
-        if not RAP.v("main.persist") then return end
+    RAP.on("save", "ai", function(force)
+        if not RAP.v("main.persist") or not RAP.store.need(KEY, force) then return end
         local en = {}
         for _, pid in ipairs(freshest(AI.en, 48)) do
             local out = {}
@@ -3443,6 +3468,7 @@ do
         end
     end
     RAP.on("ai_reward", "evo", function(g, i, v, wgt)
+        RAP.store.mark(KEY)
         local w = wgt or 1
         local row = E.bc[g]
         if not row then row = {}; E.bc[g] = row end
@@ -3507,6 +3533,7 @@ do
     E.update_champs = update_champs
     function E.evolve(verbose)
         if not RAP.v("ai.evo") then return end
+        RAP.store.mark(KEY)
         local min_n = RAP.v("ai.evo_n") or 12
         update_champs(min_n)
         local worst, wp = nil, 0
@@ -3563,6 +3590,7 @@ do
     end
     RAP.on("round", "evo", function() E.rounds = E.rounds + 1; if E.rounds % 4 == 0 then E.evolve(false) end end)
     RAP.resets.evo = function()
+        RAP.store.mark(KEY)
         E.gen, E.bc, E.trial, E.champ, E.child, E.ab, E.ab_last, E.fail = 0, {}, {}, {}, {}, {}, {}, {}
         for _, i in ipairs(E.slots) do apply(P[i], seed()); reset_slot(i) end
     end
@@ -3608,8 +3636,8 @@ do
             end
         end
     end
-    RAP.on("save", "evo", function()
-        if not RAP.v("main.persist") then return end
+    RAP.on("save", "evo", function(force)
+        if not RAP.v("main.persist") or not RAP.store.need(KEY, force) then return end
         local gs, bc = {}, {}
         for k, i in ipairs(E.slots) do gs[k] = P[i].genome end
         for g, row in pairs(E.bc) do local t = {}; for i, v in pairs(row) do t[tostring(i)] = { U.round(v[1] * 100) / 100, U.round(v[2] * 100) / 100 } end; bc[g] = t end
@@ -5614,7 +5642,11 @@ do
         print(string.format("[shots] no direction breakdown: shooter hidden (dormant) %d | shooter > 2500u away %d | other %d | late impacts recovered %d",
             s.nodir_dormant or 0, s.nodir_far or 0, s.nodir_other or 0, s.late_impact or 0))
     end
-    C.save = function() RAP.run("save"); print("[eclipse] saved") end
+    C.save = function()
+        RAP.save_all(true)
+        local io = RAP.store.io
+        print(string.format("[eclipse] saved: %d key(s), %.0f KB, %.1f ms", io.n, io.bytes / 1024, io.ms))
+    end
     RAP.console = C
     -- команды: /eclipse <команда> (основное имя) или /raap <команда> (старое имя, оставлено для привычки)
     -- true = команда скрипта (ввод не уходит в консоль игры)
@@ -5649,10 +5681,19 @@ do
     -- Сохранение (сотни KB JSON) - не в createmove: там оно раз в минуту давало фриз и пропущенный тик посреди боя.
     -- Теперь - в начале раунда и после твоей смерти (для DM-серверов без раундов), не чаще раза в 30 с, и при выгрузке.
     local last_save = globals.realtime
+    -- v52: плановое сохранение пишет только измененные ключи (RAP.store.mark), force - все; время и объем - /eclipse db
+    function RAP.save_all(force)
+        local io, clock = RAP.store.io, RAP.prof.clock
+        io.n, io.bytes, io.skipped = 0, 0, 0
+        local t0 = clock and clock()
+        RAP.run("save", force and true or false)
+        io.ms = t0 and (clock() - t0) * 1000 or 0
+        io.force, io.t = force and true or false, globals.realtime
+    end
     local function save_soon()
         if globals.realtime - last_save < 30 then return end
         last_save = globals.realtime
-        RAP.run("save")
+        RAP.save_all(false)
     end
     events.createmove:set(function(cmd) RAP.run("tick", cmd) end)
     events.render:set(function() RAP.run("frame") end)
@@ -5664,7 +5705,7 @@ do
     end)
     events.level_init:set(function() RAP.run("level") end)
     events.shutdown:set(function()
-        RAP.run("save")
+        RAP.save_all(true)
         RAP.arb.release()
         RAP.run("shutdown")
         RAP.own_release_all()
@@ -5970,6 +6011,11 @@ do
         for name, key in pairs(PARTS) do
             local ok, raw = pcall(function() return db[key] end)
             print(string.format("[db] %-9s %6.1f KB", name, (ok and type(raw) == "string") and #raw / 1024 or 0))
+        end
+        local io = RAP.store.io
+        if io.t then
+            print(string.format("[db] last save %.0f s ago (%s): %d key(s) written, %d unchanged skipped, %.0f KB, %.1f ms",
+                globals.realtime - io.t, io.force and "full" or "changed only", io.n, io.skipped, io.bytes / 1024, io.ms))
         end
         print("[db] reset a part: /eclipse db reset <part>")
     end
