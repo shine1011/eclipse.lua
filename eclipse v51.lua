@@ -1574,7 +1574,7 @@ do
         if d and type(d.ctx) == "table" then
             for k, e in pairs(d.ctx) do
                 if type(k) == "string" and type(e) == "table" and type(e.arms) == "table" then
-                    local ne = { arms = new_arms(), ts = tonumber(e.ts) or 0 }
+                    local ne = { arms = new_arms(), ts = tonumber(e.ts) or 0, dts = U.num(e.dts, 0) }
                     for a = 1, #ARMS do
                         local x = e.arms[a] or e.arms[tostring(a)]
                         if type(x) == "table" then for f in pairs(ne.arms[a]) do ne.arms[a][f] = U.num(x[f], 0, 1e5) or 0 end end
@@ -1592,14 +1592,17 @@ do
             end
             if type(d.corr) == "table" then for k, v in pairs(d.corr) do local x = U.num(v, 0, 1e4); if x then ST.corr[k] = x end end end
             -- затухание по времени: опыт старше half_life_days весит вдвое меньше (оценка, не счетчики)
+            -- v52: отсчет от dts - момента, до которого затухание уже применено. Раньше каждая загрузка заново
+            -- применяла затухание за весь возраст записи (ts не менялся), и частые перезагрузки стирали опыт.
             local okt, now = pcall(common.get_unixtime)
             if okt and now and now > 0 then
                 local hl = U.max(0.5, RAP.CFG.strategy.half_life_days) * 86400
                 for _, e in pairs(ST.ctx) do
-                    local age = now - (e.ts or now)
+                    local age = now - U.max(e.ts or now, e.dts or 0)
                     if age > 3600 then
                         local w = 0.5 ^ (age / hl)
                         for a = 1, #ARMS do local x = e.arms[a]; x.h, x.m, x.w2 = x.h * w, x.m * w, x.w2 * w * w end
+                        e.dts = now
                     end
                 end
             end
