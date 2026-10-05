@@ -366,6 +366,31 @@ test("ideal tick: releasing the key releases charge block and peek assist", func
     no_errors(E)
 end)
 
+test("shot pressure: tick-based levels, stall log with causes, Delay Shot off on every found path", function()
+    local E = S.load(PATH)
+    local RAP = E.RAP
+    local wpn = { m_flNextPrimaryAttack = 0, m_iClip1 = 5, get_weapon_index = function() return 7 end }
+    local me = S.player({ idx = 1, m_flNextAttack = 0, get_player_weapon = function() return wpn end,
+        get_eye_position = function() return vec(0, 0, 64) end, get_origin = function() return vec() end })
+    local enemy = S.player({ idx = 3, is_visible = function() return true end, get_origin = function() return vec(500, 0, 0) end })
+    entity.get_local_player = function() return me end
+    entity.get_players = function(_, _, cb) cb(enemy) end
+    entity.get_threat = function() return enemy end
+    local function tick() E.T.tick = E.T.tick + 1; E.T.now = E.T.now + 1 / 64; E.fire("createmove", { choked_commands = 0, view_angles = vec() }) end
+    for _ = 1, 3 do tick() end
+    assert(RAP.pressure.level == 1, "relax not after 3 ticks: " .. RAP.pressure.level)
+    for _ = 1, 3 do tick() end
+    assert(RAP.pressure.level == 2, "release not after 6 ticks")
+    E.fire("aim_fire", { id = 1, target = enemy, damage = 50 })
+    assert(#RAP.pressure.log == 1 and RAP.pressure.log[1].outcome == "shot" and RAP.pressure.log[1].level == 2)
+    local n_off = 0
+    for key, it in pairs(E.found) do if key:find("Delay Shot") and it.ov == false then n_off = n_off + 1 end end
+    assert(n_off >= 12, "Delay Shot not overridden on all paths: " .. n_off)
+    E.console("/eclipse stalls")
+    assert(has_line(E, "%[stalls%] 1 stalls"))
+    no_errors(E)
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP

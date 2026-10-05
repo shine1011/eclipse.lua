@@ -2153,6 +2153,9 @@ do
                 base_hc = V.base_seen[wkey]
             end
             local add = V.hc_add[wg] or 0
+            -- v58: при заряженном DT (не снайперы) надбавка не нужна - вторая пуля добивает, а повышенный HC
+            -- только задерживает первую
+            if add > 0 and not HG_SNIPER[wg] and (RAP.W.charge or 0) >= 1 and RAP.ref.on(RAP.ref.dt) then add = 0 end
             -- надбавка только повышает: если твой hitchance уже выше потолка, он не снижается до потолка
             local adj = base_hc and U.max(base_hc, U.min(RAP.v("rage.hc_max") or 78, base_hc + add)) or nil
             if adj and adj > base_hc then RAP.vote("hitchance", adj, 12, "adaptive +" .. U.round(adj - base_hc))
@@ -2199,61 +2202,123 @@ do
     RAP.on("tick", "arbiter", function() RAP.arb.commit() end, 99)
     -- новая карта: время выстрела врага из прошлой карты давало "enemy on-shot" постоянно (curtime начался заново)
     RAP.on("level", "rage vote", function() V.last_shot = {} end)
+    -- надбавка adaptive hitchance живет один раунд (раньше копилась до +10 на всю карту)
+    RAP.on("round", "adaptive hc", function() V.hc_add = {} end)
 end
 ---------------------------------------------------------------- shot pressure: рагебот не должен "висеть" на видимой цели
--- Цель видна, оружие готово (снайпер - в прицеле), а выстрела нет дольше stage1 -> ограничения скрипта смягчаются:
--- Force -> Prefer, малый multipoint и повышенный hitchance снимаются. Дольше stage2 -> все пункты рагебота
--- возвращаются к твоим настройкам, пока не будет выстрела. Сброс - на выстреле или потере цели.
--- В v42-v45 этой защиты не было: Force safe против jitter-врагов и поднятый hitchance давали "delay shot".
+-- Цель видна, оружие готово (снайпер - в прицеле), а выстрела нет -> ограничения скрипта смягчаются:
+-- через rage.stall_t1 тиков Force -> Prefer, малый multipoint и повышенный hitchance снимаются, через rage.stall_t2
+-- тиков все пункты рагебота возвращаются к твоим настройкам, пока не будет выстрела. Сброс - на выстреле / потере цели.
+-- v58: счет в тиках (было 350 / 800 мс - дуэль в HvH короче), видимость угрозы - каждый тик (было раз в 4 тика),
+-- каждый stall пишется в журнал с причинами (/eclipse stalls), Delay Shot ищется по всем путям сразу.
 do
     local U = RAP.U
     local G = RAP.menu.group("Rage", "Rage control", 1)
     G.switch("rage.stall", "Shot pressure (never hang on a visible target)", true,
         { tip = "If the target is visible and the weapon is ready but nothing fires, the script relaxes its own restrictions step by step." })
-    G.slider("rage.stall1", "Relax after", 150, 1500, 350, 1, "ms", { adv = true, dep = function() return RAP.v("rage.stall") end })
-    G.slider("rage.stall2", "Release all after", 300, 3000, 800, 1, "ms", { adv = true, dep = function() return RAP.v("rage.stall") end })
+    -- старые пункты (мс) сохранены для конфигов, но не используются и скрыты (v58: тики)
+    G.slider("rage.stall1", "Relax after (old, unused)", 150, 1500, 350, 1, "ms", { dep = function() return false end })
+    G.slider("rage.stall2", "Release all after (old, unused)", 300, 3000, 800, 1, "ms", { dep = function() return false end })
+    G.slider("rage.stall_t1", "Relax after", 1, 20, 3, 1, "t", { adv = true, dep = function() return RAP.v("rage.stall") end,
+        tip = "Ticks of 'visible + weapon ready + no shot' before Force -> Prefer, small multipoint and raised hitchance are dropped." })
+    G.slider("rage.stall_t2", "Release all after", 2, 40, 6, 1, "t", { adv = true, dep = function() return RAP.v("rage.stall") end,
+        tip = "Ticks before every ragebot item goes back to your settings until a shot is fired." })
     G.combo("rage.delay", "Cheat Delay Shot", { "Always off", "Off only while stalling", "Don't touch" },
         { tip = "Delay Shot waits for a tick where the resolver is more accurate: fewer correction misses, but later shots. Default: always off - shots come on time." })
 
-    local SP = { since = nil, level = 0, stalls = 0, relief_shots = 0 }
+    local SP = { since = nil, level = 0, stalls = 0, relief_shots = 0, log = {}, causes = {} }
     RAP.pressure = SP
-    -- Delay Shot: разные сборки держат его в разных группах - ищем по нескольким путям на всех вкладках оружия
-    local DS
-    for _, p in ipairs({ { "Selection", "Delay Shot" }, { "Accuracy", "Delay Shot" }, { "Selection", "Hit Chance", "Delay Shot" }, { "Main", "Delay Shot" } }) do
-        local P, n = RAP.ref.multi(p[1], p[2], p[3])
-        if P then DS = P; RAP.ref.tabs.delay_shot = n; break end
+    -- Delay Shot: разные сборки держат его в разных группах. v58: проверяются ВСЕ пути, override идет в объединение
+    -- найденных пунктов (раньше поиск останавливался на первом: в твоей сборке нашелся только общий пункт без
+    -- вкладок оружия - "0 weapon tab(s)" - и Delay Shot на вкладках оружия оставался включенным).
+    local DS, DS_PATHS, DS_TABS = nil, {}, 0
+    do
+        local all, seen, best_n, primary = {}, {}, -1, nil
+        for _, p in ipairs({ { "Selection", "Delay Shot" }, { "Selection", "Hit Chance", "Delay Shot" }, { "Accuracy", "Delay Shot" },
+            { "Main", "Delay Shot" }, { "Accuracy", "Hit Chance", "Delay Shot" }, { "Main", "Enabled", "Delay Shot" } }) do
+            local P, n = RAP.ref.multi(p[1], p[2], p[3])
+            if P then
+                DS_PATHS[#DS_PATHS + 1] = string.format("%s (%d weapon tab(s))", table.concat(p, " / "), n)
+                DS_TABS = DS_TABS + n
+                for _, it in ipairs(P.all) do if not seen[it] then seen[it], all[#all + 1] = true, it end end
+                if n > best_n then best_n, primary = n, P end
+            end
+        end
+        if primary then
+            DS = { all = all, name = primary.name, items = primary.items, cur = primary.cur }
+            function DS.set_override(v)
+                for _, it in ipairs(all) do if v == nil then pcall(it.override, it) else pcall(it.override, it, v) end end
+            end
+            function DS.get() local ok, v = pcall(function() return DS.cur():get() end); return ok and v or nil end
+        end
     end
-    RAP.ref.delay_shot = DS
+    RAP.ref.delay_shot, RAP.ref.tabs.delay_shot, RAP.ref.delay_shot_paths = DS, DS_TABS, DS_PATHS
     local DS_OWN = false
+
+    -- снимок причин stall: что стояло в арбитре на этом тике (до голосов самого shot pressure)
+    local CAUSE_KEYS = { "hitchance", "safe_points", "body_aim", "mp_head", "mp_body", "hitboxes", "ensure_safety", "min_damage" }
+    local function snapshot()
+        local W, v = RAP.W, {}
+        for _, k in ipairs(CAUSE_KEYS) do
+            local x = RAP.arb.votes[k]
+            if x and x.value ~= nil and x.value ~= false then
+                local val = type(x.value) == "table" and table.concat(x.value, ",") or tostring(x.value)
+                v[#v + 1] = k .. "=" .. val .. " <- " .. tostring(x.src)
+            end
+        end
+        local okh, hc = pcall(U.hc_cur)
+        return { t = globals.realtime, wg = W.wgroup, charge = W.charge or 0, ds = DS and (DS_OWN and "off (script)" or tostring(DS.get())) or "not found",
+            hc_menu = okh and hc or nil, votes = v }
+    end
+    local function close_stall(outcome)
+        local cur = SP.cur
+        if not cur then return end
+        cur.ticks, cur.outcome, cur.level = globals.tickcount - SP.t0 + 1, outcome, SP.max_level or 0
+        SP.log[#SP.log + 1] = cur
+        if #SP.log > 40 then table.remove(SP.log, 1) end
+        for _, vv in ipairs(cur.votes) do local k = vv:match("^([%w_]+)=") or vv; SP.causes[k] = (SP.causes[k] or 0) + 1 end
+        if #cur.votes == 0 then SP.causes["(no script votes)"] = (SP.causes["(no script votes)"] or 0) + 1 end
+        SP.cur = nil
+    end
+
     RAP.on("our_fire", "pressure", function(rec)
         if SP.level > 0 then SP.relief_shots = SP.relief_shots + 1 end
         if SP.since then rec.ctx.rt = U.round((globals.curtime - SP.since) * 1000) end
-        SP.since, SP.level = nil, 0
+        close_stall("shot")
+        SP.since, SP.level, SP.t0, SP.max_level = nil, 0, nil, 0
     end)
     RAP.on("tick", "shot pressure", function()
         local W = RAP.W
-        -- Delay Shot
+        -- Delay Shot (скрипт его только выключает, никогда не включает)
         if DS then
             local mode = RAP.v("rage.delay")
             local want = W.alive and RAP.v("rage.on") and not RAP.binds.is_active(DS.name) and (mode == "Always off" or (mode == "Off only while stalling" and SP.level >= 2))
             if want and not DS_OWN then DS.set_override(false); DS_OWN = true
             elseif not want and DS_OWN then DS.set_override(nil); DS_OWN = false end
         end
-        if not W.alive then SP.since, SP.level = nil, 0; return end
-        local now = globals.curtime
+        local function reset(outcome) if SP.cur then close_stall(outcome) end; SP.since, SP.level, SP.t0, SP.max_level = nil, 0, nil, 0 end
+        if not W.alive then reset("died"); return end
+        local now, tick = globals.curtime, globals.tickcount
         local thr = W.threat
-        local tc = thr and RAP.TC[thr:get_index()]
+        local vis = false
+        if thr then
+            local okd, dorm = pcall(thr.is_dormant, thr)
+            if okd and not dorm then local okv, v = pcall(thr.is_visible, thr); vis = okv and v or false end
+        end
         local wpn, me = W.weapon, W.me
         local ready = wpn and (wpn.m_iClip1 or 1) > 0 and now >= (wpn.m_flNextPrimaryAttack or 0) and now >= (me.m_flNextAttack or 0)
         local scoped_ok = not (W.wgroup == "Scout" or W.wgroup == "AWP" or W.wgroup == "Auto") or me.m_bIsScoped
-        local can = tc and not tc.dormant and tc.geo.visible and ready and scoped_ok
-        if not can then SP.since, SP.level = nil, 0; return end
-        SP.since = SP.since or now
+        local can = vis and ready and scoped_ok
+        if not can then reset(vis and "weapon not ready" or "target lost"); return end
+        if not SP.t0 or tick < SP.t0 then SP.t0, SP.since = tick, now end
         if not RAP.v("rage.stall") or not RAP.v("rage.on") then SP.level = 0; return end
-        local dt = (now - SP.since) * 1000
-        local lvl = dt >= (RAP.v("rage.stall2") or 800) and 2 or (dt >= (RAP.v("rage.stall1") or 350) and 1 or 0)
-        if lvl > SP.level then SP.stalls = SP.stalls + (SP.level == 0 and 1 or 0) end
+        local ticks = tick - SP.t0 + 1                  -- сколько тиков подряд "видно + готово + нет выстрела"
+        local t1 = RAP.v("rage.stall_t1") or 3
+        local t2 = U.max(t1 + 1, RAP.v("rage.stall_t2") or 6)
+        local lvl = ticks >= t2 and 2 or (ticks >= t1 and 1 or 0)
+        if lvl > 0 and SP.level == 0 then SP.stalls = SP.stalls + 1; SP.cur = snapshot() end
         SP.level = lvl
+        SP.max_level = U.max(SP.max_level or 0, lvl)
         if lvl == 0 then return end
         local O = RAP.ref.OPT
         if lvl == 1 then
@@ -2261,7 +2326,7 @@ do
             local w = RAP.arb.votes
             local sp, ba = w.safe_points, w.body_aim
             if sp and sp.value == O.sp_force then RAP.vote("safe_points", O.sp_prefer or false, 90, "shot pressure: relax") end
-            if ba and ba.value == O.ba_force and not (ba.src or ""):find("low HP") then RAP.vote("body_aim", O.ba_prefer or false, 90, "shot pressure: relax") end
+            if ba and ba.value == O.ba_force and not (ba.src or ""):find("lethal") then RAP.vote("body_aim", O.ba_prefer or false, 90, "shot pressure: relax") end
             RAP.vote("mp_head", false, 90, "shot pressure: relax"); RAP.vote("mp_body", false, 90, "shot pressure: relax")
             RAP.vote("hitchance", false, 90, "shot pressure: relax")
         else
@@ -2270,12 +2335,38 @@ do
             end
         end
     end, 90)
+    RAP.cmd.stalls = function(arg)
+        local n = tonumber(arg) or 15
+        print(string.format("[stalls] %d stalls (visible + ready + no shot >= %d ticks), %d shots after relief | Delay Shot: %s",
+            SP.stalls, RAP.v("rage.stall_t1") or 3, SP.relief_shots, #DS_PATHS > 0 and table.concat(DS_PATHS, "; ") or "NOT FOUND"))
+        local parts = {}
+        for k, c in pairs(SP.causes) do parts[#parts + 1] = { k, c } end
+        table.sort(parts, function(x, y) return x[2] > y[2] end)
+        local out = {}
+        for _, p2 in ipairs(parts) do out[#out + 1] = p2[1] .. " " .. p2[2] end
+        if #out > 0 then print("[stalls] script votes active at stall start: " .. table.concat(out, ", ")) end
+        for i = U.max(1, #SP.log - n + 1), #SP.log do
+            local x = SP.log[i]
+            print(string.format("[stalls] %-6s %2d ticks lvl %d -> %-16s | DT %.0f%% | Delay Shot %s | your HC %s | %s", tostring(x.wg), x.ticks or 0,
+                x.level or 0, tostring(x.outcome), (x.charge or 0) * 100, tostring(x.ds), tostring(x.hc_menu),
+                #x.votes > 0 and table.concat(x.votes, "; ") or "no script votes (cheat settings only)"))
+        end
+    end
     -- база отклоняет запись (слишком большой ключ): обучение не сохраняется - видно сразу, а не только в консоли
     RAP.on("ind_rows", "db", function(add)
         if next(RAP.store.rejected) then add("DB FULL: LEARNING NOT SAVED", color(255, 110, 110), 1) end
     end)
     RAP.on("ind_rows", "pressure", function(add)
         if SP.level > 0 then add(SP.level == 2 and "PRESSURE: RELEASED" or "PRESSURE: RELAX", color(255, 200, 120), 2) end
+        -- Delay Shot не найден на вкладках оружия: его override, скорее всего, не действует - видно на экране
+        if RAP.v("rage.delay") ~= "Don't touch" and DS_TABS == 0 then
+            add(DS and "DELAY SHOT: CHECK WEAPON TABS" or "DELAY SHOT: NOT FOUND", color(255, 150, 90), 2)
+        end
+    end)
+    RAP.on("load", "delay shot check", function()
+        if DS_TABS == 0 and RAP.toast then
+            RAP.toast(DS and "Delay Shot found only as a global item - check it on weapon tabs (/eclipse selftest)" or "Delay Shot item not found (/eclipse selftest)")
+        end
     end)
     function SP.release_ds() if DS and DS_OWN then DS.set_override(nil); DS_OWN = false end end
     function SP.ds_owned() return DS_OWN end
@@ -5887,7 +5978,9 @@ do
             or string.format("Min. Damage in %d weapon tab(s)", R.tabs.min_damage or 0))
         chk("Safe Points options", R.OPT.sp_prefer ~= nil and R.OPT.sp_force ~= nil, tostring(R.OPT.sp_prefer) .. " / " .. tostring(R.OPT.sp_force))
         chk("Body Aim options", R.OPT.ba_prefer ~= nil and R.OPT.ba_force ~= nil, tostring(R.OPT.ba_prefer) .. " / " .. tostring(R.OPT.ba_force))
-        print("[selftest] info    cheat Delay Shot item: " .. (R.delay_shot and (tostring(R.tabs.delay_shot) .. " weapon tab(s)") or "not found (option has no effect)"))
+        print("[selftest] info    cheat Delay Shot item: " .. ((R.delay_shot_paths and #R.delay_shot_paths > 0) and table.concat(R.delay_shot_paths, "; ") or "not found (option has no effect)"))
+        warn("Delay Shot found on weapon tabs", (R.tabs.delay_shot or 0) > 0,
+            (R.tabs.delay_shot or 0) > 0 and (R.tabs.delay_shot .. " tab(s)") or "only a global item or none: per-weapon Delay Shot may stay ON - check it in the menu")
         -- P2-11: видно ли твое значение hitchance, пока скрипт держит override (тогда adaptive / lag hc следуют за меню)
         do
             local P = R.rage.hitchance
