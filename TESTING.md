@@ -1,11 +1,11 @@
-# Проверка в игре (v52 – v55)
+# Проверка в игре (v52 – v56)
 
 Офлайн-проверки (`luajit -bl`, `luacheck`, `luajit tests/run.lua`) ловят синтаксис и логику модулей. Поведение чита они не проверяют, поэтому ниже — то, что нужно проверить руками.
 
 Чтобы я мог разобрать результат, пришлите вывод консоли из шагов 1, 2 и 9.
 
 ## 1. Загрузка
-1. Загрузить `eclipse.lua`. В консоли должна быть строка `[ECLIPSE] 2.0 beta (v55) loaded`.
+1. Загрузить `eclipse.lua`. В консоли должна быть строка `[ECLIPSE] 2.0 beta (v56) loaded`.
 2. `/eclipse selftest` → `[FAIL] 0`. Посмотрите строки `info`:
    - `your hitchance readable under override` — включите Adaptive hitchance и дождитесь, пока скрипт поднимет hitchance (`/eclipse why` → у hitchance источник `adaptive`). Затем выполните selftest ещё раз:
      - `yes …` — база adaptive / lag hitchance следует за вашим значением в меню;
@@ -45,6 +45,9 @@
 ## 8. Консоль (v53)
 - `/eclipse help` — список команд.
 - `/eclipse why` с включённым Ideal tick → строка `other cheat items held by the script: ex.dt=true …`.
+
+## 8a. Ошибки в консоли (v56)
+- Поиграйте с включёнными «Resolver info above enemies» и «Debug panel», в том числе когда игроки выходят с сервера и меняется карта. Строк `frame:effects error: entity is invalid` быть не должно.
 
 ## 9. Что прислать мне
 ```
