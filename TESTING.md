@@ -1,11 +1,11 @@
-# Проверка в игре (v52 – v56)
+# Проверка в игре (v52 – v57)
 
 Офлайн-проверки (`luajit -bl`, `luacheck`, `luajit tests/run.lua`) ловят синтаксис и логику модулей. Поведение чита они не проверяют, поэтому ниже — то, что нужно проверить руками.
 
 Чтобы я мог разобрать результат, пришлите вывод консоли из шагов 1, 2 и 9.
 
 ## 1. Загрузка
-1. Загрузить `eclipse.lua`. В консоли должна быть строка `[ECLIPSE] 2.0 beta (v56) loaded`.
+1. Загрузить `eclipse.lua`. В консоли должна быть строка `[ECLIPSE] 2.0 beta (v57) loaded`.
 2. `/eclipse selftest` → `[FAIL] 0`. Посмотрите строки `info`:
    - `your hitchance readable under override` — включите Adaptive hitchance и дождитесь, пока скрипт поднимет hitchance (`/eclipse why` → у hitchance источник `adaptive`). Затем выполните selftest ещё раз:
      - `yes …` — база adaptive / lag hitchance следует за вашим значением в меню;
