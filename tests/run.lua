@@ -247,6 +247,15 @@ test("hitchance base: menu value used only when it differs from the override", f
     assert(RAP.U.hc_cur() == nil)
 end)
 
+test("selftest reports whether your hitchance is readable under override", function()
+    local E = S.load(PATH)
+    local it = E.RAP.ref.rage.hitchance.cur()
+    it.get = function(s) return s.v end
+    it.v, it.ov = 60, 72
+    E.console("/eclipse selftest")
+    assert(has_line(E, "readable under override: yes: menu 60, override 72"))
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP

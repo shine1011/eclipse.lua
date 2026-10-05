@@ -5678,6 +5678,19 @@ do
         chk("Safe Points options", R.OPT.sp_prefer ~= nil and R.OPT.sp_force ~= nil, tostring(R.OPT.sp_prefer) .. " / " .. tostring(R.OPT.sp_force))
         chk("Body Aim options", R.OPT.ba_prefer ~= nil and R.OPT.ba_force ~= nil, tostring(R.OPT.ba_prefer) .. " / " .. tostring(R.OPT.ba_force))
         print("[selftest] info    cheat Delay Shot item: " .. (R.delay_shot and (tostring(R.tabs.delay_shot) .. " weapon tab(s)") or "not found (option has no effect)"))
+        -- P2-11: видно ли твое значение hitchance, пока скрипт держит override (тогда adaptive / lag hc следуют за меню)
+        do
+            local P = R.rage.hitchance
+            local it = P and P.cur()
+            local okv, v = pcall(function() return it:get() end)
+            local oko, ov = pcall(function() return it:get_override() end)
+            local note
+            if not oko then note = "get_override() not available - base frozen while overridden (v52 behaviour)"
+            elseif ov == nil then note = "not overridden right now - run selftest while adaptive hitchance is active"
+            elseif okv and v ~= ov then note = "yes: menu " .. tostring(v) .. ", override " .. tostring(ov)
+            else note = "cannot tell (get() == override " .. tostring(ov) .. ")" end
+            print("[selftest] info    your hitchance readable under override: " .. note)
+        end
         local p, src = RAP.W.ping()
         chk("ping", p ~= nil, string.format("%.0f ms via %s", p * 1000, src))
         warn("profiler timer", RAP.prof.clock ~= nil, RAP.prof.clock_src)
