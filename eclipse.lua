@@ -147,7 +147,9 @@ do
             prior_weight = 10,     -- вес опыта против всех врагов (популяции) для нового врага, в выстрелах
             decay = 0.985,         -- затухание старых результатов по врагу на каждый новый выстрел
             pop_decay = 0.995,     -- затухание популяционной статистики
-            aat_bias = 2,          -- стартовый бонус: jitter -> safe point, wide -> body (в псевдо-попаданиях)
+            aat_bias = 0,          -- стартовый бонус: jitter -> safe point, wide -> body. v58: 0 (в HvH почти все jitter / wide -
+                                   -- бонус уводил каждую дуэль от головы с первого выстрела)
+            hit_prior = 0.25,      -- v58: вес старой статистики "попала пуля" (h / m) рядом с новой наградой "доля HP" (vh / vm)
             half_life_days = 7,    -- сохраненный опыт по врагу теряет половину веса за столько дней
             session_weight = 3,    -- результаты текущей сессии против этого врага весят во столько раз больше
             explore_probing = 0.08,-- доля экспериментов в состояниях UNKNOWN / PROBING / RELEARNING
@@ -156,7 +158,7 @@ do
             relearn_shots = 6,     -- выстрелов в RELEARNING после провала уверенной стратегии / смены AA врага
             explore_cooldown = 5,  -- после эксперимента столько учтенных выстрелов без новых экспериментов
             equal_margin = 0.05,   -- стратегии с оценкой ближе этого считаются равными (не "лучшая навсегда")
-            arms = "1,4,5,6",      -- активные стратегии: 1 Default 2 Head focus 3 Small mp 4 Prefer safe 5 Force safe 6 Prefer body 7 Force body
+            arms = "1,2,4,6,8",    -- v58 (было 1,4,5,6 - без головы): 1 Default 2 Head focus 3 Small mp 4 Prefer safe 5 Force safe 6 Prefer body 7 Force body
         },
         aat = {
             window = 24,           -- замеров для классификатора AA
@@ -1127,7 +1129,7 @@ do
             U.log("coach", "! many spread misses: the cheat fires at hitchance too low for the weapon. Raise base hitchance, scope in, stop before the shot (auto stop).")
         end
         if share("correction") > 0.30 then
-            U.log("coach", "! many resolver (correction) misses: the script cannot change the cheat's resolver, only aim choice. Check what Strategy AI picks against these enemies (/eclipse strat) and keep 'Head focus' disabled.")
+            U.log("coach", "! many resolver (correction) misses: the script cannot change the cheat's resolver, only aim choice. Check what Strategy AI picks against these enemies (/eclipse strat) and the head policy (Rage -> Head priority, /eclipse why).")
         end
         if share("misprediction") + share("prediction error") > 0.15 then
             U.log("coach", "! prediction misses: target is moving/lagging. Shoot after they stop, lower 'Real ping' mismatch (main.ping), avoid shooting while you are fake ducking.")
@@ -1372,11 +1374,16 @@ do
         if not t then return end
         local h = t.hist
         h.shots = h.shots + 1
-        if e.state == nil then h.hits, h.streak = h.hits + 1, 0
+        if e.state == nil then
+            h.hits, h.streak = h.hits + 1, 0
+            if e.hitgroup == 1 then h.head_hits = (h.head_hits or 0) + 1 end
         else
             h.miss[tostring(e.state)] = (h.miss[tostring(e.state)] or 0) + 1
             if RAP.strat and RAP.strat.LEARN[e.state] then h.streak = h.streak + 1 end
-            if e.wanted_hitgroup == 1 then h.head_miss = h.head_miss + 1 end
+            if e.wanted_hitgroup == 1 then
+                h.head_miss = h.head_miss + 1
+                if e.state == "correction" then h.head_corr = (h.head_corr or 0) + 1 end   -- для политики головы (v58)
+            end
             h.last_miss = tostring(e.state)
         end
     end)
@@ -1543,6 +1550,11 @@ do
     G2.slider("rs.dt_hp", "DT body HP", 20, 100, 70, 1, nil, { adv = true })
     G2.switch("rs.low_body", "Force body under HP", true)
     G2.slider("rs.low_hp", "Force body HP", 10, 100, 45, 1, nil, { adv = true })
+    G2.combo("rage.head", "Head priority", { "Balanced", "Aggressive", "Safe (strategy decides)" }, {
+        tip = "Balanced: head when the enemy is resolvable (standing, just shot, static / narrow desync). Aggressive: head unless this enemy " ..
+            "proved unresolvable (3+ correction misses at the head, no head hits). Body is still taken when it is lethal this shot." })
+    G2.slider("rage.head_w", "Head: narrow desync width", 5, 60, 25, 1, nil, { adv = true,
+        tip = "Classifier |eye - abs| below this counts as 'resolvable' (Balanced)." })
 end
 
 ---------------------------------------------------------------- rage: классификатор AA врага
@@ -1624,7 +1636,8 @@ end
 do
     local U = RAP.U
     local KEY, OLD = "rap2_strat", "rage_aa_pro_rbrain_v25"
-    local ARMS = { "Default", "Head focus", "Small multipoint", "Prefer safe", "Force safe", "Prefer body", "Force body" }
+    -- 8 "Head priority" (v58): body aim и safe points - в "Default" чита, head multipoint побольше
+    local ARMS = { "Default", "Head focus", "Small multipoint", "Prefer safe", "Force safe", "Prefer body", "Force body", "Head priority" }
     local ST = { ctx = {}, pop = {}, corr = {}, T = {}, sess = {}, ARMS = ARMS }
     RAP.strat = ST
     local LEARN = { correction = true, misprediction = true, ["prediction error"] = true }
@@ -1645,14 +1658,16 @@ do
         if not active(a) then return false end
         local O = RAP.ref.OPT
         if a == 4 then return O.sp_prefer ~= nil elseif a == 5 then return O.sp_force ~= nil
-        elseif a == 6 then return O.ba_prefer ~= nil elseif a == 7 then return O.ba_force ~= nil end
+        elseif a == 6 then return O.ba_prefer ~= nil elseif a == 7 then return O.ba_force ~= nil
+        elseif a == 8 then return O.ba_default ~= nil end
         return true
     end
     ST.arm_ok = arm_ok
     local function new_arms()
         local t = {}
         -- w2: сумма квадратов весов (для эффективного объема выборки, см. RAP.dl.n_info)
-        for a = 1, #ARMS do t[a] = { h = 0, m = 0, w2 = 0, att = 0, hits = 0, hh = 0, bh = 0, corr = 0, mis = 0, pe = 0 } end
+        -- vh / vm / vw2 (v58): награда "доля HP цели, снятая выстрелом" (убийство = 1, промах = 0) как дробные успехи
+        for a = 1, #ARMS do t[a] = { h = 0, m = 0, w2 = 0, att = 0, hits = 0, hh = 0, bh = 0, corr = 0, mis = 0, pe = 0, vh = 0, vm = 0, vw2 = 0 } end
         return t
     end
     local function ctx_entry(key)
@@ -1664,7 +1679,7 @@ do
     end
     local function pop_entry(key)
         local p = ST.pop[key]
-        if not p then p = {}; for a = 1, #ARMS do p[a] = { h = 0, m = 0 } end; ST.pop[key] = p end
+        if not p then p = {}; for a = 1, #ARMS do p[a] = { h = 0, m = 0, vh = 0, vm = 0 } end; ST.pop[key] = p end
         return p
     end
 
@@ -1686,7 +1701,13 @@ do
                 for k, p in pairs(d.pop) do
                     if type(k) == "string" and type(p) == "table" then
                         local np = pop_entry(k)
-                        for a = 1, #ARMS do local x = p[a] or p[tostring(a)]; if type(x) == "table" then np[a].h, np[a].m = U.num(x.h, 0, 1e5) or 0, U.num(x.m, 0, 1e5) or 0 end end
+                        for a = 1, #ARMS do
+                            local x = p[a] or p[tostring(a)]
+                            if type(x) == "table" then
+                                np[a].h, np[a].m = U.num(x.h, 0, 1e5) or 0, U.num(x.m, 0, 1e5) or 0
+                                np[a].vh, np[a].vm = U.num(x.vh, 0, 1e5) or 0, U.num(x.vm, 0, 1e5) or 0
+                            end
+                        end
                     end
                 end
             end
@@ -1749,29 +1770,35 @@ do
         return en.pid .. "|" .. wg .. "|" .. aat, wg, aat
     end
     -- апостериорная оценка стратегии: Beta(1 + приор + бонус + попадания, 1 + приор + промахи)
+    local ZERO_ARM = { h = 0, m = 0, w2 = 0, vh = 0, vm = 0, vw2 = 0 }
     function ST.post(key, a, wg, aat)
         local c = C()
         local e = ST.ctx[key]
-        local x = e and e.arms[a] or { h = 0, m = 0, w2 = 0 }
+        local x = e and e.arms[a] or ZERO_ARM
+        local K = c.hit_prior or 0.25
         local ph, pm = 0, 0
         if RAP.v("st.pop") then
             local P = ST.pop[wg .. "|" .. aat] or ST.pop[wg] or ST.pop.any
             if P then
-                local pr = (P[a].h + 1) / (P[a].h + P[a].m + 2)
+                local q = P[a]
+                local pr = ((q.vh or 0) + K * q.h + 1) / ((q.vh or 0) + (q.vm or 0) + K * (q.h + q.m) + 2)
                 ph, pm = pr * c.prior_weight, (1 - pr) * c.prior_weight
             end
         end
         if (aat == "jitter" and (a == 4 or a == 5)) or (aat == "wide" and (a == 6 or a == 7)) then ph = ph + c.aat_bias end
         local ss = ST.sess[key] and ST.sess[key][a]
         local sw = U.max(0, (c.session_weight or 2) - 1)
-        local sh, sm = ss and ss.h * sw or 0, ss and ss.m * sw or 0
-        local al, be = 1 + ph + x.h + sh, 1 + pm + x.m + sm
+        local sh, sm = ss and (ss.vh or 0) * sw or 0, ss and (ss.vm or 0) * sw or 0
+        -- v58: оценка = ожидаемая доля HP цели за выстрел (урон / убийство), а не доля попаданий: тело - большая
+        -- цель, и по hit rate модель по построению уходила в тело / safe point даже там, где голова убивает быстрее.
+        -- Старые h / m (попадания) остаются слабым приором с весом K - накопленный опыт не теряется.
+        local al, be = 1 + ph + (x.vh or 0) + K * x.h + sh, 1 + pm + (x.vm or 0) + K * x.m + sm
         local mean = al / (al + be)
         -- Неопределенность - только по уникальной информации: выстрелы сессии уже входят в x (их доп. вес меняет
         -- среднее, но не добавляет данных). Раньше дисперсия считалась по завышенным счетчикам -> ложная уверенность.
         -- v51: объем данных - эффективный: min(сумма весов, n_eff). Попадания в голову весят 1.5 и раньше выглядели
         -- как больше выстрелов, чем было. Старые записи без w2 считаются выборками с единичным весом.
-        local n_x = RAP.dl.n_info(x.h + x.m, x.w2)
+        local n_x = RAP.dl.n_info((x.vh or 0) + (x.vm or 0), x.vw2) + K * RAP.dl.n_info(x.h + x.m, x.w2)
         local n_u = 2 + ph + pm + n_x
         return mean, mean * (1 - mean) / (n_u + 1), n_x
     end
@@ -1895,7 +1922,7 @@ do
     -- оставались без стратегии ("-" в отчете) и не учили модель.
     -- Действовала ли стратегия на самом деле: ее голоса должны были победить в арбитре на всех ее пунктах
     -- (иначе их перебили on-shot / DT lethal / low HP / shot pressure / бинд пользователя, и выстрел - не про нее).
-    local ARM_KEYS = { [2] = { "mp_head" }, [3] = { "mp_head", "mp_body" }, [4] = { "safe_points" },
+    local ARM_KEYS = { [2] = { "mp_head" }, [3] = { "mp_head", "mp_body" }, [4] = { "safe_points" }, [8] = { "body_aim", "safe_points" },
         [5] = { "safe_points", "mp_head", "mp_body" }, [6] = { "body_aim" }, [7] = { "body_aim" } }
     function ST.effective(arm)
         local keys = ARM_KEYS[arm]
@@ -1904,12 +1931,16 @@ do
             if not RAP.ref.rage[k] then goto skip end          -- пункта нет в этой сборке чита - не проверяется
             local w = RAP.arb.why[k]
             local src = w and w.value ~= nil and tostring(w.src) or nil
-            if not src or src:sub(1, 9) ~= "strategy:" then return false, k .. " <- " .. tostring(w and w.src or "-") end
+            -- голос политики головы ("head: ...") совпадает по смыслу с головными стратегиями 2 / 8 - выстрел про них
+            local head_ok = (arm == 2 or arm == 8) and src and src:sub(1, 5) == "head:"
+            if not head_ok and (not src or src:sub(1, 9) ~= "strategy:") then return false, k .. " <- " .. tostring(w and w.src or "-") end
             ::skip::
         end
         return true
     end
-    RAP.on("our_fire", "strategy", function(rec)
+    RAP.on("our_fire", "strategy", function(rec, e)
+        -- HP цели до выстрела: для награды "доля HP" (v58)
+        if e and e.target then local okh, h = pcall(U.getf, e.target, "m_iHealth"); if okh and type(h) == "number" and h > 0 then rec.hp0 = h end end
         rec.ctx.aat = rec.idx and RAP.aat.type(rec.idx) or nil
         if not rec.idx or not RAP.v("st.on") then return end
         local t = ST.T[rec.idx]
@@ -1976,8 +2007,17 @@ do
         local c = C()
         local en = ctx_entry(key)
         local dk = c.decay ^ cw
-        for a = 1, #ARMS do local x = en.arms[a]; x.h, x.m = x.h * dk, x.m * dk end
+        for a = 1, #ARMS do local x = en.arms[a]; x.h, x.m, x.vh, x.vm, x.vw2 = x.h * dk, x.m * dk, (x.vh or 0) * dk, (x.vm or 0) * dk, (x.vw2 or 0) * dk * dk end
         local x = en.arms[arm]
+        -- v58: награда = доля HP цели, снятая выстрелом: min(урон, HP до выстрела) / HP до выстрела; убийство = 1,
+        -- промах = 0. Голова в HvH чаще убивает одним выстрелом - модель видит это напрямую, а не через вес 1.5.
+        local val = 0
+        if ok then
+            local hp0 = rec.hp0 or 100
+            val = U.clamp((e.damage or 0) / U.max(1, hp0), 0, 1)
+        end
+        rec.ctx.val = val
+        x.vh, x.vm, x.vw2 = x.vh + cw * val, x.vm + cw * (1 - val), x.vw2 + cw * cw
         x.att = x.att + 1
         -- ценность попадания: голова весит больше, "царапина" (урон < половины желаемого) меньше - стратегия
         -- оценивается по тому, сколько урона она реально приносит, а не только по факту попадания
@@ -1994,13 +2034,15 @@ do
             if e.state == "correction" then x.corr = x.corr + 1 elseif e.state == "misprediction" then x.mis = x.mis + 1 else x.pe = x.pe + 1 end
         end
         local ss = ST.sess[key]
-        if not ss then ss = {}; for a = 1, #ARMS do ss[a] = { h = 0, m = 0 } end; ST.sess[key] = ss end
+        if not ss then ss = {}; for a = 1, #ARMS do ss[a] = { h = 0, m = 0, vh = 0, vm = 0 } end; ST.sess[key] = ss end
         if ok then ss[arm].h = ss[arm].h + wt * cw else ss[arm].m = ss[arm].m + cw end
+        ss[arm].vh, ss[arm].vm = ss[arm].vh + cw * val, ss[arm].vm + cw * (1 - val)
         local pdk = c.pop_decay ^ cw
         for _, pk in ipairs({ rec.ctx.wg .. "|" .. rec.ctx.aatk, rec.ctx.wg, "any" }) do
             local P = pop_entry(pk)
-            for a = 1, #ARMS do P[a].h, P[a].m = P[a].h * pdk, P[a].m * pdk end
+            for a = 1, #ARMS do local q = P[a]; q.h, q.m, q.vh, q.vm = q.h * pdk, q.m * pdk, (q.vh or 0) * pdk, (q.vm or 0) * pdk end
             if ok then P[arm].h = P[arm].h + wt * cw else P[arm].m = P[arm].m + cw end
+            P[arm].vh, P[arm].vm = P[arm].vh + cw * val, P[arm].vm + cw * (1 - val)
         end
         -- проверка последней смены по этой гипотезе (журнал решений): исход выстрела с весом атрибуции.
         -- Вердикт "хуже" откатывает смену (DL.rb.strat) - тогда arm ~= t.arm и ниже решение не принимается.
@@ -2071,6 +2113,7 @@ do
             for a = 1, #ARMS do
                 local x = e.arms[a]
                 x.h, x.m, x.w2 = U.round(x.h * 1000) / 1000, U.round(x.m * 1000) / 1000, U.round(x.w2 * 1000) / 1000
+                x.vh, x.vm, x.vw2 = U.round((x.vh or 0) * 1000) / 1000, U.round((x.vm or 0) * 1000) / 1000, U.round((x.vw2 or 0) * 1000) / 1000
             end
         end
         for pid, v in pairs(ST.corr) do
@@ -2120,6 +2163,64 @@ do
         elseif e.state == nil or e.state == "correction" then V.hc_add[wg] = U.max(0, (V.hc_add[wg] or 0) - 2) end
     end)
 
+    -- Урон одного выстрела в грудь цели текущим оружием: damage x range_modifier^(дистанция / 500), при броне
+    -- x armor_ratio / 2 (формула CS:GO). Поля weapon info из get_weapon_info() в документации не перечислены -
+    -- под pcall, иначе - запасная таблица по группе оружия.
+    local FALLBACK = { Scout = { 88, 1.7, 0.98 }, AWP = { 115, 1.95, 0.99 }, Auto = { 80, 1.65, 0.98 }, Deagle = { 63, 1.864, 0.81 },
+        Revolver = { 86, 1.864, 0.94 }, Pistol = { 35, 1.0, 0.85 }, other = { 33, 1.5, 0.85 } }
+    local function winfo(wpn)
+        local ok, info = pcall(wpn.get_weapon_info, wpn)
+        if not ok or not info then return nil end
+        local okd, d = pcall(U.getf, info, "damage")
+        local oka, ar = pcall(U.getf, info, "armor_ratio")
+        local okr, rm = pcall(U.getf, info, "range_modifier")
+        if okd and type(d) == "number" and d > 0 then
+            return d, (oka and type(ar) == "number") and ar or 1.5, (okr and type(rm) == "number") and rm or 0.9
+        end
+        return nil
+    end
+    function V.body_damage(ent)
+        local W = RAP.W
+        local d, ar, rm
+        if W.weapon then d, ar, rm = winfo(W.weapon) end
+        if not d then local f = FALLBACK[W.wgroup or "other"] or FALLBACK.other; d, ar, rm = f[1], f[2], f[3] end
+        local okg, org = pcall(ent.get_origin, ent)
+        local dist = (okg and org and W.eye) and W.eye:dist(org) or 500
+        local dmg = d * (rm ^ (dist / 500))
+        local okarm, armor = pcall(U.getf, ent, "m_ArmorValue")
+        if okarm and type(armor) == "number" and armor > 0 then dmg = dmg * ar * 0.5 end
+        return dmg
+    end
+    -- Политика головы. Возвращает объяснение решения (для /eclipse why и debug panel) и голосует (prio 65 - выше
+    -- стратегий и force safe, ниже летального тела 67/68 и бинда / damage key / magic key / shot pressure).
+    function V.head_policy(en, onshot)
+        local mode = RAP.v("rage.head") or "Balanced"
+        if mode:find("^Safe") then return "head policy off (Safe: strategy decides)" end
+        local O = RAP.ref.OPT
+        local tc = RAP.TC[en.idx]
+        local h = tc and tc.hist
+        -- враг доказанно не резолвится в голову: 3+ промаха correction в голову в этой сессии и ни одного попадания
+        if h and (h.head_corr or 0) >= 3 and (h.head_hits or 0) == 0 then
+            return string.format("head blocked: %d correction misses at the head, 0 head hits", h.head_corr)
+        end
+        local why
+        local mv = tc and tc.move or {}
+        local width = tc and tc.aa.width
+        if onshot then why = "enemy just shot (minimal desync)"
+        elseif (mv.speed or 999) < 5 and not mv.air then why = "enemy standing"
+        elseif tc and tc.aa.type == "static" and (tc.aa.conf or 0) >= 0.5 then why = "static AA"
+        elseif width and width < (RAP.v("rage.head_w") or 25) then why = string.format("narrow desync (%.0f)", width)
+        elseif mode == "Aggressive" then why = "aggressive (not proven unresolvable)" end
+        if not why then return "strategy decides (enemy moving / wide jitter)" end
+        local src = "head: " .. why
+        -- явно "Default" чита (а не "оставить твое"): если у тебя в меню Prefer body, голова иначе не получила бы приоритет
+        RAP.vote("body_aim", O.ba_default or false, 65, src)
+        local sp = RAP.arb.votes.safe_points
+        if sp and sp.value == O.sp_force and O.sp_prefer then RAP.vote("safe_points", O.sp_prefer, 65, src) end
+        local mp = RAP.arb.votes.mp_head
+        if mp and tostring(mp.src):find("small multipoint") then RAP.vote("mp_head", false, 65, src) end
+        return "head allowed: " .. why
+    end
     local function find_threat()
         local thr = RAP.W.threat
         if not thr then return nil end
@@ -2184,18 +2285,36 @@ do
             if arm == 5 and O.sp_force then RAP.vote("safe_points", O.sp_force, 60, "strategy: force safe") end
             if arm == 6 and O.ba_prefer then RAP.vote("body_aim", O.ba_prefer, 30, "strategy: prefer body") end
             if arm == 7 and O.ba_force then RAP.vote("body_aim", O.ba_force, 60, "strategy: force body") end
+            if arm == 8 then
+                if O.ba_default then RAP.vote("body_aim", O.ba_default, 30, "strategy: head priority") end
+                if O.sp_default then RAP.vote("safe_points", O.sp_default, 30, "strategy: head priority") end
+                local mph = RAP.v("rage.mph_" .. wg) or 0
+                RAP.vote("mp_head", U.min(100, mph > 0 and mph + 25 or 85), 30, "strategy: head priority")
+            end
             -- сразу после выстрела цели десинк минимален: предпочтение корпуса снимается (голова разрешена)
             local ls = V.last_shot[idx]
-            if RAP.v("rs.onshot") and ls and now >= ls and now - ls < 0.2 then RAP.vote("body_aim", false, 40, "enemy on-shot") end
+            local onshot = ls and now >= ls and now - ls < 0.2
+            if RAP.v("rs.onshot") and onshot then RAP.vote("body_aim", false, 40, "enemy on-shot") end
+            -- политика головы (v58): голова, когда враг резолвится; тело - только когда оно реально летально
+            local hw = V.head_policy(en, onshot)
+            V.head_why = hw
+            -- тело: только если летально по урону оружия, броне и дистанции (раньше - только по HP, для любого оружия)
             local hp = ent.m_iHealth or 100
-            if RAP.v("rs.dt_body") and O.ba_prefer and not HG_SNIPER[wg] and RAP.W.charge >= 1 and RAP.ref.on(RAP.ref.dt)
-                and hp <= (RAP.v("rs.dt_hp") or 70) then RAP.vote("body_aim", O.ba_prefer, 45, "DT lethal") end
-            if RAP.v("rs.low_body") and O.ba_force and hp <= (RAP.v("rs.low_hp") or 45) then RAP.vote("body_aim", O.ba_force, 50, "low HP") end
+            local body1 = V.body_damage(ent)
+            local dt_ready = RAP.W.charge >= 1 and RAP.ref.on(RAP.ref.dt) and not HG_SNIPER[wg]
+            if RAP.v("rs.dt_body") and O.ba_prefer and dt_ready and hp <= (RAP.v("rs.dt_hp") or 70) and body1 * 2 >= hp then
+                RAP.vote("body_aim", O.ba_prefer, 67, string.format("lethal body: 2x DT %.0f >= %d hp", body1 * 2, hp))
+                V.head_why = string.format("body: lethal with DT (2 x %.0f >= %d hp)", body1, hp)
+            end
+            if RAP.v("rs.low_body") and O.ba_force and hp <= (RAP.v("rs.low_hp") or 45) and body1 >= hp then
+                RAP.vote("body_aim", O.ba_force, 68, string.format("lethal body: %.0f >= %d hp", body1, hp))
+                V.head_why = string.format("body: one body shot is lethal (%.0f >= %d hp)", body1, hp)
+            end
             V.aat, V.mode, V.why = RAP.aat.type(idx), t and RAP.strat.ARMS[t.arm] or nil, t and t.why or nil
             V.conf = t and select(1, RAP.strat.post(t.key, t.arm, t.wg, t.aat)) or nil
         else
             RAP.strat.applied = nil
-            V.aat, V.mode, V.why, V.conf = nil, nil, nil, nil
+            V.aat, V.mode, V.why, V.conf, V.head_why = nil, nil, nil, nil, nil
         end
         if RAP.v("rage.dmg_on") and RAP.v("rage.dmg_key") then RAP.vote("min_damage", RAP.v("rage.dmg_val") or 10, 70, "damage key") end
     end, 40)
@@ -3951,6 +4070,7 @@ do
             if A.def and globals.curtime - A.def < 0.2 and globals.curtime >= A.def then ov[#ov + 1] = "defensive" end
             print("[why]    overrides on top of the profile: " .. (#ov > 0 and table.concat(ov, ", ") or "none"))
         end
+        print("[why]  head policy (" .. tostring(RAP.v("rage.head")) .. "): " .. tostring(RAP.ragev and RAP.ragev.head_why or "-"))
         if c.shot then print(string.format("[why]  your last shot: %s, learning weight %.2f (%s)", c.shot.r, c.shot.w, c.shot.why)) end
         if c.eshot then print(string.format("[why]  last enemy shot at you: %s, learning weight %.2f (%s)", c.eshot.r, c.eshot.w, c.eshot.why)) end
         print(string.format("[why]  overall decision confidence: %s (%s) - the weakest link of the chain", pc(c.overall), RAP.conf_level(c.overall)))
@@ -4529,6 +4649,8 @@ do
         local L = t.learn or {}
         rows[#rows + 1] = { "STATE", L.state or "-", SCOL[L.state or ""] or DIM }
         rows[#rows + 1] = { "STRATEGY", L.arm or "-" }
+        local hw = RAP.ragev and RAP.ragev.head_why
+        if hw then rows[#rows + 1] = { "HEAD", hw, hw:find("^head allowed") and GOOD or (hw:find("^body") and WARN or nil) } end
         rows[#rows + 1] = { "CONFIDENCE", L.conf and string.format("est %.0f%%  sure %.0f%%", L.conf * 100, (L.pconf or 0) * 100) or "-" }
         rows[#rows + 1] = { "SAMPLES", L.samples and string.format("%.1f weighted", L.samples) or "0" }
         rows[#rows + 1] = { "WHY", L.why or "-" }

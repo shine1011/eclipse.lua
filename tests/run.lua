@@ -391,6 +391,61 @@ test("shot pressure: tick-based levels, stall log with causes, Delay Shot off on
     no_errors(E)
 end)
 
+local function rage_scene(widx, enemy_fields)
+    local E = S.load(PATH)
+    local RAP = E.RAP
+    local wpn = { m_flNextPrimaryAttack = 0, m_iClip1 = 5, get_weapon_index = function() return widx end, get_weapon_info = function() return nil end }
+    local me = S.player({ idx = 1, get_player_weapon = function() return wpn end, get_eye_position = function() return vec(0, 0, 64) end,
+        get_origin = function() return vec() end })
+    local enemy = S.player(enemy_fields)
+    enemy.get_origin = enemy.get_origin or function() return vec(500, 0, 0) end
+    entity.get_local_player = function() return me end
+    entity.get_players = function(_, _, cb) cb(enemy) end
+    entity.get_threat = function() return enemy end
+    local function tick() E.T.tick = E.T.tick + 1; E.T.now = E.T.now + 1 / 64; E.fire("createmove", { choked_commands = 0, view_angles = vec() }) end
+    return E, RAP, tick, enemy
+end
+
+test("head policy: standing enemy -> body aim Default at prio 65 over strategy prefer body", function()
+    local E, RAP, tick = rage_scene(11, { idx = 3, m_vecVelocity = vec(0, 0, 0) })
+    RAP.CFG.strategy.arms = "6"                          -- стратегия хочет тело
+    for _ = 1, 4 do tick() end
+    local w = RAP.arb.why.body_aim
+    assert(w and w.value == "Default" and tostring(w.src):find("^head: enemy standing"), "body_aim " .. tostring(w and w.value) .. " <- " .. tostring(w and w.src))
+    assert(RAP.ragev.head_why:find("^head allowed"))
+    no_errors(E)
+end)
+
+test("head policy: lethal body (auto, 40 hp, armor) forces body; pistol at 40 hp does not", function()
+    local E, RAP, tick = rage_scene(11, { idx = 3, m_iHealth = 40, m_ArmorValue = 100, m_vecVelocity = vec(0, 0, 0) })
+    for _ = 1, 4 do tick() end
+    local w = RAP.arb.why.body_aim
+    assert(w.value == "Force" and tostring(w.src):find("lethal body"), "auto: " .. tostring(w.value) .. " <- " .. tostring(w.src))
+    local E2, RAP2, tick2 = rage_scene(2, { idx = 3, m_iHealth = 40, m_ArmorValue = 100, m_vecVelocity = vec(0, 0, 0) })
+    for _ = 1, 4 do tick2() end
+    local w2 = RAP2.arb.why.body_aim
+    assert(not (w2.value == "Force"), "pistol forced body at 40 hp with armor")
+    no_errors(E); no_errors(E2)
+end)
+
+test("strategy reward: share of target HP (kill = 1), old hit stats only a weak prior", function()
+    local E = S.load(PATH)
+    local ST = E.RAP.strat
+    local rec = { idx = 5, pid = "x:1", hp0 = 100, ctx = { arm = 2, key = "x:1|Scout|jitter", wg = "Scout", aatk = "jitter", attr = 1 } }
+    E.hook("our_ack", "strategy")(rec, { state = nil, damage = 100, hitgroup = 1 })
+    local x = ST.ctx["x:1|Scout|jitter"].arms[2]
+    assert(math.abs(x.vh - 1) < 1e-6 and math.abs(x.vm) < 1e-6, "kill must be reward 1")
+    rec.hp0 = 100
+    E.hook("our_ack", "strategy")(rec, { state = nil, damage = 25, hitgroup = 3 })
+    assert(math.abs(x.vh - (0.985 + 0.25)) < 0.01, "body 25 dmg must be 0.25: " .. x.vh)
+    -- голова (2 убийства) против тела с теми же попаданиями: оценка головы выше
+    local key = "x:2|Auto|jitter"
+    local function ack(arm, dmg) E.hook("our_ack", "strategy")({ idx = 6, pid = "x:2", hp0 = 100, ctx = { arm = arm, key = key, wg = "Auto", aatk = "jitter", attr = 1 } },
+        { state = nil, damage = dmg, hitgroup = arm == 2 and 1 or 3 }) end
+    for _ = 1, 3 do ack(2, 100); ack(6, 30) end
+    assert(ST.post(key, 2, "Auto", "jitter") > ST.post(key, 6, "Auto", "jitter"), "head kills must beat body chip damage")
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP
