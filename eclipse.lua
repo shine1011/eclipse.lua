@@ -3,7 +3,7 @@
     Внутренние имена (таблица RAP, ключи базы rap2_*) сохранены: так переносится все накопленное обучение.
     Модули: core / api (пункты чита, арбитр) / menu / world / shots / telemetry / rage (classifier, brain, resolver,
     голосование) / AA (refs, профили, меню, движок, AI, эволюция) / visuals / lag / exploits / dormant / AI peek /
-    grenades / misc / presets / console. Исходники - src/*.lua, сборка - build.sh.
+    grenades / misc / presets / console. Исходник - этот единственный файл (eclipse.lua); версия - RAP.VERSION и GitHub Releases.
 
     Устройство: весь код в таблице RAP, каждый модуль - отдельный блок do ... end и публикует только то, что нужно
     другим (RAP.<модуль>). Порядок работы за тик: world -> shots -> модули голосуют в арбитр -> arbiter.commit().
