@@ -176,6 +176,7 @@ do
             rollback = 1,          -- 1 = откатывать смены с вердиктом "хуже", 0 = только записывать
         },
         shots = { near = 60, inacc_drop = 0.4 },
+        peek = { scan_ms = 1.5 },        -- AI Peek: время скана за тик (мс), остаток направлений - на следующих тиках
         dormant = { hit_radius = 16 },   -- радиус (юниты) вокруг точки, попадание в который считается попаданием (оценка HC)
         log = { keep = 600 },      -- выстрелов в журнале (для сравнения версий)
         db = { schema = 50 },
@@ -5012,29 +5013,48 @@ do
         end)
         return list
     end
-    local function scan(cmd, me, tl)
+    -- v52: скан с бюджетом времени на тик (CFG.peek.scan_ms). Направления перебираются по порядку; если бюджет
+    -- кончился, состояние сохраняется (SCN[group]) и скан продолжается со следующего направления на следующем тике.
+    -- Раньше все направления x тики симуляции x trace_bullet считались за один тик - просадка при зажатой клавише.
+    -- Продолжение действительно, пока главная цель та же, ты сместился < 8 юнитов и прошло < 0.3 с.
+    local SCN = {}
+    local SAVED_KEYS = { "forwardmove", "sidemove", "buttons", "in_duck", "in_jump", "in_speed" }
+    local function scan(cmd, me, tl, group)
         local org, eye = me:get_origin(), RAP.W.eye
         local vofs = eye.z - org.z
-        for _, t in ipairs(tl) do
-            if not t.dormant then for _, p in ipairs(points(t)) do if dmg_at(me, eye, p, t) >= need_dmg(t) then return nil, "already hittable from here" end end end
+        local now = globals.curtime
+        local n = RAP.v("peek.dirs") or 8
+        local sc = SCN[group]
+        if sc and (sc.tidx ~= tl[1].idx or sc.n ~= n or now - sc.t0 > 0.3 or now < sc.t0 or org:dist2d(sc.org) >= 8) then sc = nil end
+        if not sc then
+            for _, t in ipairs(tl) do
+                if not t.dormant then for _, p in ipairs(points(t)) do if dmg_at(me, eye, p, t) >= need_dmg(t) then SCN[group] = nil; return nil, "already hittable from here" end end end
+            end
+            local use = { tl[1], tl[2] }
+            local pts, needs = {}, {}
+            for k, t in ipairs(use) do pts[k], needs[k] = points(t), need_dmg(t) end
+            sc = { k = 0, n = n, best = nil, blocked = 0, base = eye:to(tl[1].org):angles().y, org = org:clone(), t0 = now, tidx = tl[1].idx,
+                use = use, pts = pts, needs = needs }
+            SCN[group] = sc
         end
         local ticks = U.max(4, U.round((RAP.v("peek.time") or 400) / 1000 / globals.tickinterval))
         local still = (RAP.W.vel and RAP.W.vel:length2d() or 0) < 20
         local va = cmd.view_angles
         local y0 = va.y
         local saved = {}
-        for _, k in ipairs({ "forwardmove", "sidemove", "buttons", "in_duck", "in_jump", "in_speed" }) do saved[k] = getf(cmd, k) end
-        local best, blocked, n = nil, 0, RAP.v("peek.dirs") or 8
-        local use = { tl[1], tl[2] }
-        local pts, needs = {}, {}
-        for k, t in ipairs(use) do pts[k], needs[k] = points(t), need_dmg(t) end
+        for _, k in ipairs(SAVED_KEYS) do saved[k] = getf(cmd, k) end
+        local clock = RAP.prof.clock
+        local budget = (RAP.CFG.peek.scan_ms or 1.5) / 1000
+        local c0 = clock and clock()
+        local use, pts, needs, start = sc.use, sc.pts, sc.needs, sc.org
+        local pri_dmg = RAP.v("peek.pri") == "Highest damage"
         local ok, err = pcall(function()
             setf(cmd, "forwardmove", 450); setf(cmd, "sidemove", 0)
             if saved.buttons ~= nil then setf(cmd, "buttons", 0) end
             setf(cmd, "in_duck", false); setf(cmd, "in_jump", false); setf(cmd, "in_speed", false)
-            local base = eye:to(tl[1].org):angles().y
-            for k = 0, n - 1 do
-                local ang = U.norm(base + 90 + k * 360 / n)
+            while sc.k < n do
+                local ang = U.norm(sc.base + 90 + sc.k * 360 / n)
+                sc.k = sc.k + 1
                 va.y = ang
                 pcall(U.setf, cmd, "view_angles", va)
                 local sim
@@ -5043,13 +5063,12 @@ do
                 local prev = 0
                 for tk = 1, ticks do
                     sim:think()
-                    if type(sim.flags) == "number" and bit.band(sim.flags, 1) ~= 1 then break end
                     local spd = sim.velocity:length2d()
                     if tk > 3 and spd < prev - 25 then break end
                     prev = spd
                     if tk % 2 == 0 then
                         local o = sim.origin:clone()
-                        if o:dist2d(org) >= 6 then
+                        if o:dist2d(start) >= 6 then
                             local e = o:clone()
                             local vo = sim.view_offset
                             e.z = e.z + ((type(vo) == "number" and vo > 10) and vo or vofs)
@@ -5058,27 +5077,31 @@ do
                                 local need, hd = needs[k2], 0
                                 for _, p in ipairs(pts[k2]) do local dm = dmg_at(me, e, p, t); if dm >= need and dm > hd then hd = dm end end
                                 if hd > 0 then
-                                    if dangerous(t.idx, ang) then blocked = blocked + 1 else found = { t = t, dmg = hd } end
+                                    if dangerous(t.idx, ang) then sc.blocked = sc.blocked + 1 else found = { t = t, dmg = hd } end
                                     break
                                 end
                             end
                             if found then
-                                local better = not best or (RAP.v("peek.pri") == "Highest damage" and (found.dmg > best.dmg + 1 or (found.dmg >= best.dmg - 1 and tk < best.ticks)))
-                                    or (RAP.v("peek.pri") ~= "Highest damage" and tk < best.ticks)
-                                if better then best = { yaw = ang, ticks = tk, start = org:clone(), pos = o, dmg = found.dmg, tidx = found.t.idx, thr = found.t.ent, dormant = found.t.dormant } end
+                                local best = sc.best
+                                local better = not best or (pri_dmg and (found.dmg > best.dmg + 1 or (found.dmg >= best.dmg - 1 and tk < best.ticks)))
+                                    or (not pri_dmg and tk < best.ticks)
+                                if better then sc.best = { yaw = ang, ticks = tk, start = start:clone(), pos = o, dmg = found.dmg, tidx = found.t.idx, thr = found.t.ent, dormant = found.t.dormant } end
                                 break
                             end
                         end
                     end
                 end
+                if c0 and sc.k < n and clock() - c0 > budget then break end
             end
         end)
         va.y = y0
         pcall(U.setf, cmd, "view_angles", va)
         for k, v in pairs(saved) do setf(cmd, k, v) end
-        if not ok then error(err, 0) end
-        if best then return best end
-        if blocked > 0 then return nil, "only spots where you died recently" end
+        if not ok then SCN[group] = nil; error(err, 0) end
+        if sc.k < n then return nil, "pending" end
+        SCN[group] = nil
+        if sc.best then return sc.best end
+        if sc.blocked > 0 then return nil, "only spots where you died recently" end
         return nil, string.format("no spot within %d ms", RAP.v("peek.time") or 400)
     end
     local function stop(cmd, me)
@@ -5131,8 +5154,12 @@ do
             local vis, hid = {}, {}
             for _, t in ipairs(tl) do if t.dormant then hid[#hid + 1] = t else vis[#vis + 1] = t end end
             local c, why
-            if #vis > 0 then c, why = scan(cmd, me, vis) end
-            if not c and #hid > 0 and why ~= "already hittable from here" then c, why = scan(cmd, me, hid) end
+            if #hid == 0 then SCN.hid = nil end
+            -- пока продолжается скан спрятавшихся целей, видимые не пересканируются (иначе полный скан каждый тик)
+            if #vis > 0 and not SCN.hid then c, why = scan(cmd, me, vis, "vis") end
+            if not c and #hid > 0 and why ~= "already hittable from here" and why ~= "pending" then c, why = scan(cmd, me, hid, "hid") end
+            -- скан не уложился в бюджет тика: продолжение на следующем тике (без паузы 0.08 с)
+            if why == "pending" then PK.reason = "scanning..."; PK.last_scan = now - 1; return end
             -- скан тяжелый (направления x тики x trace_bullet): после пустого скана следующий через 0.25 с, а не 0.08 с
             if not c then PK.reason = why or "no spot"; PK.last_scan = now + 0.17; return end
             local ready = U.max(wpn.m_flNextPrimaryAttack or 0, me.m_flNextAttack or 0) - now
