@@ -255,11 +255,19 @@ do
         end
         for i = 1, #list do RAP.U.safe(list[i].key, list[i].fn, ...) end
     end
+    -- кэш значений меню на проход: одна таблица, очищается table.clear (LuaJIT), если он доступен в песочнице -
+    -- иначе новая таблица на проход, как раньше
+    local okc, tclear = pcall(require, "table.clear")
+    if not okc or type(tclear) ~= "function" then tclear = nil end
+    local VC = {}
     function RAP.run(phase, ...)
         local list = RAP.hooks[phase]
         if not list then return end
         local top = (phase == "tick" or phase == "frame") and not RAP.vcache
-        if top then RAP.vcache = {} end
+        if top then
+            if tclear then tclear(VC) else VC = {} end
+            RAP.vcache = VC
+        end
         run_list(list, ...)
         if top then RAP.vcache = nil end
     end
