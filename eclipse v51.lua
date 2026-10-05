@@ -795,6 +795,11 @@ do
             end
         end
     end, 5)
+    -- новая карта: записи со старым curtime никогда не оценились бы и перехватывали бы новые bullet_fire
+    RAP.on("level", "shots", function()
+        SH.pending, SH.done, SH.hurt, SH.elast, SH.olast, SH.ours = {}, {}, {}, {}, {}, {}
+        SH.last_hurt = nil
+    end)
 
     -- твои выстрелы: aim_fire / aim_ack -> подписчики "our_fire" / "our_ack"
     SH.ours = {}
@@ -1341,7 +1346,7 @@ do
                 local tc = att and RAP.TC[att:get_index()]
                 local row = { v = RAP.VERSION, t = okt and ts or 0, hs = e.headshot and 1 or 0, w = tostring(e.weapon or "?"),
                     prof = AA.cur and AA.cur.name or "-", grp = AA.group or "?", st = W.state or "?", side = AA.flip and "R" or "L",
-                    def = (AA.def and globals.curtime - AA.def < 0.3) and 1 or 0, dt = (W.charge or 0) >= 1 and 1 or 0,
+                    def = (AA.def and globals.curtime >= AA.def and globals.curtime - AA.def < 0.3) and 1 or 0, dt = (W.charge or 0) >= 1 and 1 or 0,
                     brute = AA.brute and 1 or 0, man = AA.manual or 0, spd = W.vel and U.round(W.vel:length2d()) or 0,
                     dist = tc and tc.geo.dist and U.round(tc.geo.dist) or nil, eaat = tc and tc.aa.type or "?" }
                 DU.deaths[#DU.deaths + 1] = row
@@ -2045,7 +2050,8 @@ do
             if arm == 6 and O.ba_prefer then RAP.vote("body_aim", O.ba_prefer, 30, "strategy: prefer body") end
             if arm == 7 and O.ba_force then RAP.vote("body_aim", O.ba_force, 60, "strategy: force body") end
             -- сразу после выстрела цели десинк минимален: предпочтение корпуса снимается (голова разрешена)
-            if RAP.v("rs.onshot") and now - (V.last_shot[idx] or -9) < 0.2 then RAP.vote("body_aim", false, 40, "enemy on-shot") end
+            local ls = V.last_shot[idx]
+            if RAP.v("rs.onshot") and ls and now >= ls and now - ls < 0.2 then RAP.vote("body_aim", false, 40, "enemy on-shot") end
             local hp = ent.m_iHealth or 100
             if RAP.v("rs.dt_body") and O.ba_prefer and not HG_SNIPER[wg] and RAP.W.charge >= 1 and RAP.ref.on(RAP.ref.dt)
                 and hp <= (RAP.v("rs.dt_hp") or 70) then RAP.vote("body_aim", O.ba_prefer, 45, "DT lethal") end
@@ -2059,6 +2065,8 @@ do
         if RAP.v("rage.dmg_on") and RAP.v("rage.dmg_key") then RAP.vote("min_damage", RAP.v("rage.dmg_val") or 10, 70, "damage key") end
     end, 40)
     RAP.on("tick", "arbiter", function() RAP.arb.commit() end, 99)
+    -- новая карта: время выстрела врага из прошлой карты давало "enemy on-shot" постоянно (curtime начался заново)
+    RAP.on("level", "rage vote", function() V.last_shot = {} end)
 end
 ---------------------------------------------------------------- shot pressure: рагебот не должен "висеть" на видимой цели
 -- Цель видна, оружие готово (снайпер - в прицеле), а выстрела нет дольше stage1 -> ограничения скрипта смягчаются:
@@ -2519,7 +2527,7 @@ do
         end
         if RAP.v("aa.lim") == "After getting hit" then S.lim_until = now + bt end
     end
-    RAP.on("level", "aa brute", function() S.bhits, S.bflips, S.last_brute, S.brute_until, S.lim_until, S.def_until, S.fh = {}, {}, nil, 0, 0, 0, {} end)
+    RAP.on("level", "aa brute", function() S.bhits, S.bflips, S.last_brute, S.brute_until, S.lim_until, S.def_until, S.fh, AA.def = {}, {}, nil, 0, 0, 0, {}, nil end)
     RAP.on("enemy_shot", "aa brute", function(kind, rec)
         local now = globals.curtime
         if kind == "hit" then AA.brute_hit(rec)
@@ -2689,7 +2697,7 @@ do
         if AA.fs then add("FREESTAND", color(200, 220, 255), 3) end
         if AA.safe then add("SAFE HEAD", color(160, 255, 160), 2) end
         if AA.low then add("LOW HP", color(255, 120, 120), 2) end
-        if AA.def and globals.curtime - AA.def < 0.15 then add("DEFENSIVE", color(160, 255, 200), 2) end
+        if AA.def and globals.curtime >= AA.def and globals.curtime - AA.def < 0.15 then add("DEFENSIVE", color(160, 255, 200), 2) end
         if AA.brute then add("BRUTE", color(255, 140, 140), 3) end
         if AA.lim then add("LIMIT RND", color(220, 200, 255), 5) end
         if AA.inv then add("PHASE SHIFT", color(255, 200, 150), 4) end
@@ -4425,6 +4433,13 @@ do
         end)
     end)
     RAP.on("enemy_shot", "flinch", function(kind) if kind == "hit" then S.flinch_until = globals.curtime + 0.3 end end)
+    -- новая карта: curtime начинается заново, старые "до момента X" держали бы Auto OS (DT выключен) и Break LC
+    -- включенными, пока новый curtime не догонит старый (до десятков минут)
+    RAP.on("level", "exploits", function()
+        S.brk_until, S.flash_until, S.flinch_until, S.os_until, S.last_wpn, S.prev_ground, S.fall = 0, 0, 0, 0, nil, true, 0
+    end)
+    -- "до момента t" активно, только если t впереди не дальше max_d секунд (защита от сброса curtime без level_init)
+    local function until_ok(now, t, max_d) return now < t and t - now <= max_d end
 
     local PRED = { Soft = { 1, 3, 0.031 }, Medium = { 1, 2, 0.026 }, Extreme = { 1, 1, 0.015625 }, Ultimate = { 0, 1, 0.015625 } }
     local PRED_DEF, pred_on, pred_cur = { 1, 2, 0.015625 }, false, nil
@@ -4479,7 +4494,7 @@ do
         local want_dt, want_hs
         if it_on and RAP.v("it.dt") then want_dt = true end
         if want_dt == nil and RAP.v("ex.autos") and widx and SNIPER[widx] and charged and W.threat and on_peek(me, W.threat) then S.os_until = now + 0.2 end
-        if want_dt == nil and now < S.os_until then want_hs, want_dt = true, false end
+        if want_dt == nil and until_ok(now, S.os_until, 0.2) then want_hs, want_dt = true, false end
         RAP.own("ex.dt", R.dt, want_dt)
         RAP.own("ex.hs", R.hs, want_hs)
         -- auto recharge
@@ -4505,8 +4520,9 @@ do
             local excl = (RAP.v("ex.brk_rev") and widx == 64) or (RAP.v("ex.brk_nade") and widx and widx >= 43 and widx <= 48)
             local reload = false
             pcall(function() reload = (W.weapon.m_bInReload or false) end)
-            brk = not excl and (now < S.brk_until or (now < S.flinch_until and U.has(trig, "Flinch"))
-                or (now < S.flash_until and U.has(trig, "Flashed")) or (RAP.aa.def and now - RAP.aa.def < 0.12 and U.has(trig, "Defensive"))
+            local def_t = RAP.aa.def
+            brk = not excl and (until_ok(now, S.brk_until, 0.25) or (until_ok(now, S.flinch_until, 0.3) and U.has(trig, "Flinch"))
+                or (until_ok(now, S.flash_until, 10) and U.has(trig, "Flashed")) or (def_t and now >= def_t and now - def_t < 0.12 and U.has(trig, "Defensive"))
                 or (reload and U.has(trig, "Reloading")))
         end
         RAP.own("ex.dtlag", R.dt_lag, brk and "Always On" or nil)
@@ -4594,7 +4610,7 @@ do
         if S.mk then add("MAGIC KEY", color(255, 120, 200), 1) end
         if S.nos then add("NOSCOPE", color(255, 210, 150), 3) end
         if S.js then add("JUMP SCOUT", color(200, 220, 255), 3) end
-        if globals.curtime < S.os_until then add("AUTO OS", color(200, 200, 255), 3) end
+        if until_ok(globals.curtime, S.os_until, 0.2) then add("AUTO OS", color(200, 200, 255), 3) end
     end)
 end
 ---------------------------------------------------------------- dormant aimbot (скрипт): стрельба по врагу за стеной по ESP-данным
