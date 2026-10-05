@@ -3147,7 +3147,14 @@ do
         local since = s.t and now - s.t or 1e9
         if since < 0 then since = 1e9 end
         local need = since < 60 and 0.99 or 0.95
-        if s.conf >= need and since > 15 then
+        -- откаченное (проверка показала "хуже") состояние phase shift для этого врага не включается verify.block_s секунд
+        if s.conf >= need and since > 15 and not RAP.dl.blocked("phase", pid, not s.inv) then
+            -- журнал решений (P3-6): смена проверяется по уворотам этого врага после нее; "было" - его доля уворотов до смены
+            local pd, pn = s.d[1] + s.d[2], n1 + n2
+            local pm = (pd + 1) / (pn + 2)
+            RAP.dl.record("phase", pid, s.inv, not s.inv, string.format("hits side %s %.0f%% vs %.0f%%", p1 > p2 and "A" or "B",
+                U.max(p1, p2) * 100, U.min(p1, p2) * 100), { conf = s.conf, pre_m = pm, pre_v = pm * (1 - pm) / (pn + 3),
+                lf = s.inv and "ON" or "OFF", lt = s.inv and "OFF" or "ON" })
             s.inv = not s.inv
             s.h, s.d, s.t = { 0, 0 }, { 0, 0 }, now
             if RAP.v("ai.logs") then U.log("ai", "%s hits side %s %.0f%% vs %.0f%% (confidence %.0f%%) -> phase shift %s",
@@ -3157,6 +3164,20 @@ do
         end
     end
 
+    -- исход выстрела врага для проверки последней смены phase shift против него (вариант = текущее s.inv)
+    local function phase_outcome(pid, dodge, w)
+        local s = pid and AI.sm[pid]
+        if s then RAP.dl.outcome("phase", pid, s.inv == true, dodge, w) end
+    end
+    -- откат phase shift, который проверка признала хуже: только если у врага все еще стоит d.to
+    RAP.dl.rb.phase = function(d)
+        local s = AI.sm[d.key]
+        if not s or s.inv ~= d.to then return false end
+        s.inv, s.h, s.d, s.t, s.conf = d.from, { 0, 0 }, { 0, 0 }, globals.curtime, 0
+        RAP.store.mark(KEY)
+        if RAP.toast then RAP.toast("Phase shift rolled back: " .. (d.from and "ON" or "OFF")) end
+        return true
+    end
     local function bd_note(t, i, dodge, w)
         for _, x in pairs(t) do x[1], x[2] = x[1] * 0.995, x[2] * 0.995 end
         local x = t[i]
@@ -3218,11 +3239,11 @@ do
         RAP.dl.outcome("aa", g, i, dodge, w)
         if dodge then
             reward(g, i, rec.pid, dodge_value(rec.dist) * (rec.w or 1) * aw, w)
-            if aw >= 0.5 then side_note(rec.pid, rec.ctx.flip, false) end
+            if aw >= 0.5 then side_note(rec.pid, rec.ctx.flip, false); phase_outcome(rec.pid, true, w) end
             return
         end
         reward(g, i, rec.pid, (rec.hitgroup == 1 and -3 or -1.5) * aw, w)
-        if aw >= 0.5 then side_note(rec.pid, rec.ctx.flip, true) end
+        if aw >= 0.5 then side_note(rec.pid, rec.ctx.flip, true); phase_outcome(rec.pid, false, w) end
         -- слабо атрибутированное попадание (тело, freestanding) учит статистику, но не запускает смену профиля
         if aw < 0.5 then return end
         -- Смена профиля после попадания по тебе. Правила стабильности:
