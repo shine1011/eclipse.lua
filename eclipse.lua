@@ -58,7 +58,19 @@ do
     function U.getf(o, k) return o[k] end
     function U.setf(o, k, v) o[k] = v end
     -- текущее значение hitchance на вкладке текущего оружия (для базы adaptive / lag hc)
-    function U.hc_cur() local P = RAP.ref.rage.hitchance; return P and P.cur():get() end
+    -- Возвращает значение, только если это точно ТВОЕ значение из меню: без override - get(); при override -
+    -- get(), если он отличается от get_override() (docs: override не меняет значения меню). Если они равны, понять
+    -- нельзя - nil (база остается последней увиденной). v53: раньше база замирала на все время владения.
+    function U.hc_cur()
+        local P = RAP.ref.rage.hitchance
+        if not P then return nil end
+        local it = P.cur()
+        local v = it:get()
+        local okg, ov = pcall(it.get_override, it)
+        if okg and ov ~= nil then return v ~= ov and v or nil end
+        if RAP.arb.owned.hitchance and not okg then return nil end   -- get_override нет в сборке: как раньше
+        return v
+    end
     RAP.U = U
 end
 
@@ -2122,8 +2134,7 @@ do
             if not base_hc then
                 -- база - твое значение на вкладке текущего оружия (у каждой вкладки свое, общее значение путало оружия)
                 local wkey = RAP.W.wsub or "Global"
-                local ok, cur = pcall(U.hc_cur)
-                if RAP.arb.owned.hitchance then cur = nil end      -- свое значение не берем за базу
+                local ok, cur = pcall(U.hc_cur)                    -- только твое значение, не наш override
                 if ok and type(cur) == "number" then V.base_seen[wkey] = cur end
                 base_hc = V.base_seen[wkey]
             end
@@ -4552,7 +4563,7 @@ do
         -- пропускался -> арбитр снимал override -> на следующем тике голос снова был: hitchance мигал каждый тик.
         local wkey = RAP.W.wsub or "Global"
         local ok, cur = pcall(U.hc_cur)
-        if ok and type(cur) == "number" and not RAP.arb.owned.hitchance then L.base_seen[wkey] = cur end
+        if ok and type(cur) == "number" then L.base_seen[wkey] = cur end
         if add ~= 0 then
             -- поверх голоса с меньшим приоритетом (adaptive / оружие), а не вместо него
             local v = RAP.arb.votes.hitchance
