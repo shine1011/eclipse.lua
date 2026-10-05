@@ -159,6 +159,7 @@ do
             rollback = 1,          -- 1 = откатывать смены с вердиктом "хуже", 0 = только записывать
         },
         shots = { near = 60, inacc_drop = 0.4 },
+        dormant = { hit_radius = 16 },   -- радиус (юниты) вокруг точки, попадание в который считается попаданием (оценка HC)
         log = { keep = 600 },      -- выстрелов в журнале (для сравнения версий)
         db = { schema = 50 },
     }
@@ -4696,8 +4697,46 @@ do
     G.switch("dor.scope", "Dormant: auto scope", true, { dep = d })
     G.slider("dor.n", "Dormant: spread samples", 64, 256, 160, 1, nil, { dep = d, adv = true })
     G.combo("dor.sel", "Dormant: target", { "Best damage", "Best hit chance", "Closest to crosshair", "Lowest health" }, { dep = d })
-    local D = { active = false }
+    local D = { active = false, seen = {}, r2 = {} }
     RAP.dormant = D
+    -- точки по высоте над origin (грудь / живот / таз): v52 - детерминированный мультипоинт вместо random(32, 50),
+    -- который перебрасывался на каждом скане - точка прицела и оценка шанса "прыгали"
+    local PTS_STAND, PTS_DUCK = { 50, 40, 32 }, { 40, 32, 24 }
+    local rnd = math.random or function(a, b) return utils.random_float(a or 0, b or 1) end
+    -- выборка разброса один раз на скан: квадраты отклонений (тангенсы), отсортированы - шанс попадания для любой
+    -- дистанции = доля выборки внутри круга (бинарный поиск). Раньше 2n вызовов random_float на каждую цель.
+    local function sample_spread(spread, inacc, n)
+        local r2 = D.r2
+        for i = 1, n do
+            local a1, r1 = rnd() * 6.2831853, rnd() * spread
+            local a2, r2_ = rnd() * 6.2831853, rnd() * inacc
+            local ox, oy = math.cos(a1) * r1 + math.cos(a2) * r2_, math.sin(a1) * r1 + math.sin(a2) * r2_
+            r2[i] = ox * ox + oy * oy
+        end
+        for i = #r2, n + 1, -1 do r2[i] = nil end
+        table.sort(r2)
+    end
+    local function hc_at(dist, n)
+        local lim = (RAP.CFG.dormant.hit_radius / U.max(dist, 1)) ^ 2
+        local r2, lo, hi = D.r2, 0, n
+        while lo < hi do
+            local mid = math.floor((lo + hi + 1) / 2)
+            if r2[mid] <= lim then lo = mid else hi = mid - 1 end
+        end
+        return lo / n * 100
+    end
+    -- свежесть dormant-записи: собственная метка времени последнего изменения позиции (раньше - формула от
+    -- get_bbox().alpha, ограниченная 4 с: слайдер "record timeout" выше 4.0 ничего не менял).
+    -- network state 1 = "чит знает позицию точно" -> запись свежая; 5 = данных нет / слишком старые -> пропуск.
+    local function age_of(en, ns, org, now)
+        local s = D.seen[en.idx]
+        if not s or s.pid ~= en.pid then s = { pid = en.pid }; D.seen[en.idx] = s end
+        if not en.dormant or ns == 1 or not s.x or U.abs(s.x - org.x) + U.abs(s.y - org.y) + U.abs(s.z - org.z) > 1 then
+            s.x, s.y, s.z, s.t = org.x, org.y, org.z, now
+        end
+        return now - s.t
+    end
+    RAP.on("level", "dormant aimbot", function() D.seen, D.best, D.found, D.scan_t = {}, nil, false, nil end)
     RAP.on("tick", "dormant aimbot", function(cmd)
         D.active = false
         if not RAP.v("dor.on") or not RAP.W.alive then return end
@@ -4714,44 +4753,45 @@ do
         local eye = W.eye
         local timeout = (RAP.v("dor.time") or 20) / 10
         local need_hc, n, sel = RAP.v("dor.hc") or 60, RAP.v("dor.n") or 160, RAP.v("dor.sel")
-        -- поиск (trace_bullet + выборка разброса на каждого dormant-врага) - раз в 3 тика, между ними - кэш
+        -- поиск (trace_bullet по точкам + шанс попадания на каждого dormant-врага) - раз в 3 тика, между ними - кэш
         local tc = globals.tickcount
         local best, found = D.best, D.found
-        if best and not pcall(function() assert(best.ent:is_alive() and best.ent:is_dormant()) end) then best = nil end
+        if best then
+            local oka, alive = pcall(best.ent.is_alive, best.ent)
+            local okd, dorm = pcall(best.ent.is_dormant, best.ent)
+            if not (oka and alive and okd and dorm) then best = nil end
+        end
         local rescan = not D.scan_t or tc - D.scan_t >= 3 or tc < D.scan_t
-        if rescan then D.scan_t, best, found = tc, nil, false end
-        for _, en in ipairs(rescan and W.enemies or {}) do
-            local pl = en.ent
-            if en.dormant then
+        if rescan then
+            D.scan_t, best, found = tc, nil, false
+            local rt = globals.realtime
+            local sampled = false
+            for _, en in ipairs(W.enemies) do
+                local pl = en.ent
+                local org = pl:get_origin()
                 local okn, ns = pcall(pl.get_network_state, pl)
-                local okb, bb = pcall(pl.get_bbox, pl)
-                if okn and ns ~= 0 and ns ~= 5 and okb and bb and (4 - U.clamp(bb.alpha or 0, 0, 0.8) / 0.8 * 4) < timeout then
-                    local pos = pl:get_origin()
-                    pos.z = pos.z + utils.random_float(32, 50)
-                    local dmg = utils.trace_bullet(me, eye, pos, function(ent) return ent == pl end)
+                local age = org and age_of(en, okn and ns or nil, org, rt) or 1e9
+                if en.dormant and org and okn and ns ~= 0 and ns ~= 5 and age < timeout then
                     local hp = pl.m_iHealth or 100
-                    if dmg and dmg >= U.min(RAP.v("dor.dmg") or 20, hp) then
-                        -- отклонение пули на дистанции цели: (spread + inaccuracy) - тангенсы угла, промах = смещение * дистанция.
-                        -- Раньше dir:vectors() трактовал направление как углы, и круг разброса лежал в плоскости x/y мира.
-                        local dist = eye:dist(pos)
-                        local r2max = (16 / U.max(dist, 1)) ^ 2
-                        local hits = 0
-                        for _ = 1, n do
-                            local a1, r1 = utils.random_float(0, 6.2831853), utils.random_float(0, spread)
-                            local a2, r2 = utils.random_float(0, 6.2831853), utils.random_float(0, inacc)
-                            local ox, oy = math.cos(a1) * r1 + math.cos(a2) * r2, math.sin(a1) * r1 + math.sin(a2) * r2
-                            if ox * ox + oy * oy <= r2max then hits = hits + 1 end
-                        end
-                        local hc = hits / n * 100
-                        found = true
-                        if hc >= need_hc then
-                            local score
-                            if sel == "Best hit chance" then score = hc elseif sel == "Lowest health" then score = -hp
-                            elseif sel == "Closest to crosshair" then
-                                local an, va = eye:to(pos):angles(), cmd.view_angles
-                                score = -(U.abs(U.norm(an.x - va.x)) + U.abs(U.norm(an.y - va.y)))
-                            else score = dmg end
-                            if not best or score > best.score then best = { pos = pos, score = score, ent = pl } end
+                    local need_dmg = U.min(RAP.v("dor.dmg") or 20, hp)
+                    local duck = (pl.m_flDuckAmount or 0) > 0.5
+                    for _, dz in ipairs(duck and PTS_DUCK or PTS_STAND) do
+                        local pos = vector(org.x, org.y, org.z + dz)
+                        -- skip-колбэк: true = "не пропускать" (docs: ShouldHitEntity) - трасса попадает только в эту цель
+                        local dmg = utils.trace_bullet(me, eye, pos, function(ent) return ent == pl end)
+                        if dmg and dmg >= need_dmg then
+                            if not sampled then sample_spread(spread, inacc, n); sampled = true end
+                            local hc = hc_at(eye:dist(pos), n)
+                            found = true
+                            if hc >= need_hc then
+                                local score
+                                if sel == "Best hit chance" then score = hc elseif sel == "Lowest health" then score = -hp * 1000 + dmg * hc / 100
+                                elseif sel == "Closest to crosshair" then
+                                    local an, va = eye:to(pos):angles(), cmd.view_angles
+                                    score = -(U.abs(U.norm(an.x - va.x)) + U.abs(U.norm(an.y - va.y)))
+                                else score = dmg * hc / 100 end          -- ожидаемый урон: урон x шанс попадания
+                                if not best or score > best.score then best = { pos = pos, score = score, ent = pl, dmg = dmg, hc = hc } end
+                            end
                         end
                     end
                 end
@@ -4759,7 +4799,7 @@ do
         end
         D.best, D.found = best, found
         D.active = found
-        if found and RAP.v("dor.stop") then pcall(function() cmd.block_movement = 1 end) end
+        if found and RAP.v("dor.stop") then cmd.block_movement = 1 end      -- docs: 1 = замедление до мин. скорости оружия
         if not best or now < (me.m_flNextAttack or 0) then return end
         local info = wpn:get_weapon_info()
         if info and info.weapon_type == 5 and not me.m_bIsScoped and RAP.v("dor.scope") then
@@ -4769,7 +4809,10 @@ do
         if now < nxt then return end
         cmd.in_attack = true
         local ang = eye:to(best.pos):angles()
-        pcall(function() ang = ang - me.m_aimPunchAngle * cvar.weapon_recoil_scale:float() end)
+        local cv, okr, rs = cvar.weapon_recoil_scale, false, nil
+        if cv then okr, rs = pcall(cv.float, cv) end
+        local punch = me.m_aimPunchAngle
+        if okr and type(rs) == "number" and punch then ang = ang - punch * rs end
         cmd.view_angles = ang
     end, 50)
     RAP.on("ind_rows", "dormant", function(add) if D.active then add("DORMANT", color(200, 170, 255), 3) end end)
