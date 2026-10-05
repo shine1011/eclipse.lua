@@ -1,5 +1,5 @@
 --[[
-    ECLIPSE (2.0 beta, v53) — скрипт для Neverlose (CS:GO legacy). Ранее назывался Rage AA Pro 2.
+    ECLIPSE (2.0 beta, v54) — скрипт для Neverlose (CS:GO legacy). Ранее назывался Rage AA Pro 2.
     Внутренние имена (таблица RAP, ключи базы rap2_*) сохранены: так переносится все накопленное обучение.
     Модули: core / api (пункты чита, арбитр) / menu / world / shots / telemetry / rage (classifier, brain, resolver,
     голосование) / AA (refs, профили, меню, движок, AI, эволюция) / visuals / lag / exploits / dormant / AI peek /
@@ -10,7 +10,7 @@
     Ни один модуль не вызывает override напрямую для рагебот-пунктов: только RAP.vote(). Это убирает "войну"
     переопределений, а /eclipse why показывает, кто какое решение принял.
 ]]
-local RAP = { NAME = "ECLIPSE", VERSION = "2.0 beta (v53)", mods = {}, tick = {}, frame = {}, hooks = {}, cmd = {}, resets = {} }
+local RAP = { NAME = "ECLIPSE", VERSION = "2.0 beta (v54)", mods = {}, tick = {}, frame = {}, hooks = {}, cmd = {}, resets = {} }
 
 ---------------------------------------------------------------- util
 do
