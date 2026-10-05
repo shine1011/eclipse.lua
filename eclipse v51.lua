@@ -1904,6 +1904,9 @@ do
             for a = 1, #ARMS do P[a].h, P[a].m = P[a].h * pdk, P[a].m * pdk end
             if ok then P[arm].h = P[arm].h + wt * cw else P[arm].m = P[arm].m + cw end
         end
+        -- проверка последней смены по этой гипотезе (журнал решений): исход выстрела с весом атрибуции.
+        -- Вердикт "хуже" откатывает смену (DL.rb.strat) - тогда arm ~= t.arm и ниже решение не принимается.
+        RAP.dl.outcome("strat", key, arm, ok, cw)
         -- решение о смене (зависит от состояния)
         local t = rec.idx and ST.T[rec.idx]
         if not t or t.key ~= key then return end
@@ -1938,6 +1941,16 @@ do
         end
         evaluate(t)
     end)
+    -- откат смены стратегии, которую проверка признала хуже (RAP.dl): цель с той же гипотезой, где все еще стоит d.to
+    RAP.dl.rb.strat = function(d)
+        for _, t in pairs(ST.T) do
+            if t.key == d.key and t.arm == d.to then
+                switch(t, d.from, "rollback: " .. tostring(d.lt) .. " was worse")
+                return true
+            end
+        end
+        return false
+    end
     RAP.on("level", "strategy", function() ST.T, ST.sess = {}, {} end)
     RAP.resets.strategy = function() ST.ctx, ST.pop, ST.corr, ST.sess, ST.T = {}, {}, {}, {}, {} end
     RAP.on("save", "strategy", function()
@@ -2911,7 +2924,8 @@ do
     function AI.best(g, exclude, pid, optimistic)
         local best, bm = nil, -1e9
         for _, i in ipairs(pool(g)) do
-            if i ~= exclude then
+            -- откаченный (проверка показала "хуже") профиль не выбирается verify.block_s секунд
+            if i ~= exclude and not RAP.dl.blocked("aa", g, i) then
                 local m, v = AI.post(g, i, pid)
                 if optimistic then m = m + U.sqrt(v) end
                 if m > bm then best, bm = i, m end
@@ -2948,7 +2962,7 @@ do
         if U.rand(1, 1000) <= xp * 1000 then
             local best, bv = nil, -1e9
             for _, i in ipairs(pool(g)) do
-                if i ~= exclude then
+                if i ~= exclude and not RAP.dl.blocked("aa", g, i) then
                     local m, v = AI.post(g, i, pid)
                     local smp = m + U.randn() * U.sqrt(v)
                     if smp > bv then best, bv = i, smp end
@@ -2967,6 +2981,12 @@ do
             local now = globals.curtime
             AI.since[g] = now
             if old then AI.last_switch[g] = now end
+            -- журнал решений: смена профиля проверяется по уворотам после нее (evo - не здесь, у него свой A/B)
+            if old and why and how ~= "evo" then
+                local pid = RAP.W.threat and RAP.W.pid(RAP.W.threat)
+                local pm, pv = AI.post(g, old, pid)
+                RAP.dl.record("aa", g, old, i, why, { pre_m = pm, pre_v = pv, lf = P[old].name, lt = P[i].name })
+            end
             if old and why and RAP.v("ai.logs") then U.log("ai", "%s: %s -> %s (%s)", g, P[old].name, P[i].name, why) end
         end
     end
@@ -3107,6 +3127,8 @@ do
             AI.bdw[wk] = AI.bdw[wk] or {}
             bd_note(AI.bdw[wk], i, dodge, w)
         end
+        -- проверка последней смены профиля в группе (откат через DL.rb.aa меняет AI.cur[g] - ниже cur ~= i)
+        RAP.dl.outcome("aa", g, i, dodge, w)
         if dodge then
             reward(g, i, rec.pid, dodge_value(rec.dist) * (rec.w or 1) * aw, w)
             if aw >= 0.5 then side_note(rec.pid, rec.ctx.flip, false) end
@@ -3225,6 +3247,12 @@ do
         AI.st, AI.en, AI.sm, AI.cur, AI.bd, AI.ebd, AI.bdw, AI.since, AI.how, AI.ets = fresh_groups(), {}, {}, {}, {}, {}, {}, {}, {}, {}
         RAP.store.set(KEY, nil)
         print("[ai] AA learning reset")
+    end
+    -- откат смены профиля, которую проверка признала хуже: только если в группе все еще стоит d.to
+    RAP.dl.rb.aa = function(d)
+        if AI.cur[d.key] ~= d.to or not P[d.from] then return false end
+        AI.set(d.key, d.from, "best", "rollback: " .. tostring(d.lt) .. " was worse")
+        return true
     end
     RAP.on("level", "ai", function() AI.since, AI.last_switch, AI.gs = {}, {}, {} end)
     RAP.resets.ai = function() AI.reset(); AI.last_switch, AI.gs = {}, {} end
