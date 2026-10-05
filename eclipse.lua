@@ -154,7 +154,7 @@ do
             hold = 0.5,            -- новый тип AA принимается, только если держится столько секунд
             change_conf = 0.5,     -- смена типа AA запускает RELEARNING только при уверенности классификатора >= этого
         },
-        -- веса атрибуции: сколько выстрел говорит о решении (0..1). Меряются по журналу: /eclipse attr, проверка: /eclipse replay attr.x=...
+        -- веса атрибуции: сколько выстрел говорит о решении (0..1). Меняются: /eclipse cfg attr.<имя> <значение>; журнал - /eclipse journal
         attr = {
             correction = 1.0,      -- твой промах correction: о стратегии
             misprediction = 0.5,
@@ -229,8 +229,10 @@ do
     -- профилировщик: /eclipse perf [сек] включает замер (по умолчанию выключен - ноль накладных расходов).
     -- На модуль: вызовы, сумма, максимум, ошибки и до 400 последних замеров для p95.
     local clock = (os and os.clock) or nil
-    if not clock then pcall(function() local f = common.get_timestamp; if f and f() then clock = function() return f() / 1000 end end end) end
-    RAP.prof = { on = false, until_t = 0, d = {}, clock = clock }
+    local clock_src = clock and "os.clock" or nil
+    -- docs: common.get_timestamp - "high precision timestamp in milliseconds"
+    if not clock then pcall(function() local f = common.get_timestamp; if f and f() then clock = function() return f() / 1000 end; clock_src = "common.get_timestamp" end end) end
+    RAP.prof = { on = false, until_t = 0, d = {}, clock = clock, clock_src = clock_src or "none (perf and AI Peek budget off)" }
     -- tick / frame: на время прохода значения пунктов меню кэшируются (RAP.v вызывается сотни раз за тик,
     -- каждый раз с pcall). Вне прохода (колбэки меню, кнопки) кэша нет - всегда свежие значения.
     local function run_list(list, ...)
@@ -607,6 +609,12 @@ do
         c.pid, c.t = pid, now
         return pid
     end
+    -- игрок вышел / зашел: тот же индекс сущности может достаться другому игроку - кэш pid сбрасывается
+    -- (раньше до 2 с статистика могла уйти чужому pid)
+    local function pid_flush() for k in pairs(PIDC) do PIDC[k] = nil end end
+    pcall(function() events.player_disconnect:set(function() RAP.U.safe("pid flush", pid_flush) end) end)
+    pcall(function() events.player_connect_full:set(function() RAP.U.safe("pid flush", pid_flush) end) end)
+    RAP.on("level", "world", pid_flush)
     function W.is_bot_pid(pid) return pid ~= nil and pid:sub(1, 4) == "bot:" end
     function W.learn(pid) return pid ~= nil and (RAP.v("main.bots") or not W.is_bot_pid(pid)) end
 
@@ -2229,6 +2237,10 @@ do
             end
         end
     end, 90)
+    -- база отклоняет запись (слишком большой ключ): обучение не сохраняется - видно сразу, а не только в консоли
+    RAP.on("ind_rows", "db", function(add)
+        if next(RAP.store.rejected) then add("DB FULL: LEARNING NOT SAVED", color(255, 110, 110), 1) end
+    end)
     RAP.on("ind_rows", "pressure", function(add)
         if SP.level > 0 then add(SP.level == 2 and "PRESSURE: RELEASED" or "PRESSURE: RELAX", color(255, 200, 120), 2) end
     end)
@@ -5624,6 +5636,7 @@ do
         print("[selftest] info    cheat Delay Shot item: " .. (R.delay_shot and (tostring(R.tabs.delay_shot) .. " weapon tab(s)") or "not found (option has no effect)"))
         local p, src = RAP.W.ping()
         chk("ping", p ~= nil, string.format("%.0f ms via %s", p * 1000, src))
+        warn("profiler timer", RAP.prof.clock ~= nil, RAP.prof.clock_src)
         chk("db / json", pcall(function() db.rap2_test = json.stringify({ 1 }); assert(json.parse(db.rap2_test)[1] == 1); db.rap2_test = nil end))
         local SH = RAP.shots
         chk("enemy shot tracking", not ((SH.stat.fire or 0) >= 20 and SH.impacts == 0),
@@ -5644,6 +5657,22 @@ do
             if type(v) == "table" then v = table.concat(v, ",") end
             print(string.format("[why] %-12s %-14s <- %s", key, tostring(v or "yours"), w.src))
         end
+        -- переопределения вне арбитра (exploits / ideal tick / noscope / Delay Shot): они не видны в списке выше
+        local own = {}
+        for k, o in pairs(RAP.own_list()) do
+            local v = o.v
+            if type(v) == "table" then v = "{" .. table.concat(v, ",") .. "}" end
+            own[#own + 1] = k .. "=" .. tostring(v)
+        end
+        if RAP.pressure and RAP.pressure.ds_owned and RAP.pressure.ds_owned() then own[#own + 1] = "Delay Shot=off (rage.delay)" end
+        table.sort(own)
+        print("[why] other cheat items held by the script: " .. (#own > 0 and table.concat(own, ", ") or "none"))
+    end
+    C.help = function()
+        print("[eclipse] " .. RAP.VERSION .. " - console commands (/eclipse <command>):")
+        print("[eclipse]   selftest [release]  health  perf [sec]  why  strat  ai  evo  evolve  decisions [n]  journal [n]")
+        print("[eclipse]   report  coach  deaths  shots  peek  replay [aa | strategy.x=v ...]  cfg [path value | reset]")
+        print("[eclipse]   db [reset <part>]  save  reset_ai")
     end
     C.brain = function() RAP.cmd.strat() end
     C.cfg = function(arg)
