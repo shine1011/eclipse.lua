@@ -3338,6 +3338,10 @@ do
     -- откат смены профиля, которую проверка признала хуже: только если в группе все еще стоит d.to
     RAP.dl.rb.aa = function(d)
         if AI.cur[d.key] ~= d.to or not P[d.from] then return false end
+        -- профиль, который ты с тех пор убрал из пула (или выключенный Evo-слот), не возвращается
+        local in_pool = false
+        for _, i in ipairs(pool(d.key)) do if i == d.from then in_pool = true; break end end
+        if not in_pool then return false end
         AI.set(d.key, d.from, "best", "rollback: " .. tostring(d.lt) .. " was worse")
         return true
     end
