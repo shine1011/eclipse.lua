@@ -2796,7 +2796,8 @@ do
         AA.low = low
         it_fs = it_fs or low
         local fs = (RAP.v("aa.fs") or it_fs) and S.manual == 0
-        if fs and RAP.v("aa.fsfix") then
+        -- v58: edge fix не выключает freestanding в ideal tick и пока враг может попасть (голова открылась бы на пике)
+        if fs and RAP.v("aa.fsfix") and W.can_hit_me == nil and not (RAP.it and RAP.it.st ~= "OFF") then
             local ok, ta = pcall(rage.antiaim.get_target, rage.antiaim)
             local ok2, tb = pcall(rage.antiaim.get_target, rage.antiaim, true)
             ok = ok and ok2
@@ -4637,7 +4638,17 @@ do
     G2.switch("it.dt", "Ideal tick: force double tap", true, { dep = ion })
     G2.switch("it.fs", "Ideal tick: freestanding on peek", true, { dep = ion })
     G2.switch("it.js", "Ideal tick: jump scout", false, { dep = ion })
-    G2.switch("it.ap", "Ideal tick: peek assist", false, { dep = ion })
+    G2.switch("it.ap", "Ideal tick: peek assist", false, { dep = ion, adv = true,
+        tip = "v58: peek assist is enabled automatically while 'Teleport back after shot' is on." })
+    G2.switch("it.tp", "Ideal tick: teleport back after shot", true, { dep = ion,
+        tip = "Peek -> shot -> the remaining exploit ticks teleport you back to the start position -> recharge behind cover." })
+    G2.slider("it.tp_wait", "Teleport: wait for 2nd DT bullet", 0, 8, 3, 1, "t", { dep = function() return ion() and RAP.v("it.tp") end, adv = true,
+        tip = "If the first bullet was not lethal, wait this many ticks for the second DT bullet before teleporting." })
+    G2.slider("it.tp_off", "Teleport tick offset", 0, 4, 1, 1, "t", { dep = function() return ion() and RAP.v("it.tp") end, adv = true,
+        tip = "Ticks after the shot before the teleport (0 = same tick)." })
+    G2.switch("it.safe_charge", "Ideal tick: recharge only when safe", true, { dep = ion,
+        tip = "Exploit charge is blocked while an enemy can hit you (max 1.5 s), and forced as soon as you are back in cover." })
+    G2.switch("it.def", "Ideal tick: defensive while peeking", true, { dep = ion, adv = true })
     G2.switch("it.recharge", "Auto recharge exploit when no enemy", true)
     G2.switch("it.at", "Air teleport", false)
     G2.slider("it.at_int", "Air teleport interval (ticks)", 4, 40, 12, 1, nil, { dep = function() return RAP.v("it.at") end })
@@ -4730,7 +4741,6 @@ do
         -- ideal tick
         local it_on = RAP.v("it.on") and RAP.v("it.key")
         S.it_on = it_on
-        RAP.own("it.ap", R.peek_assist, (it_on and RAP.v("it.ap")) and true or nil)
         -- DT держим включенным все время, пока активен ideal tick: раньше он требовал charged и threat,
         -- после первого выстрела заряд падал -> DT снимался -> перезарядки не было, и ideal tick "умирал"
         -- (freestanding для ideal tick теперь в AA engine)
@@ -4740,8 +4750,8 @@ do
         if want_dt == nil and until_ok(now, S.os_until, 0.2) then want_hs, want_dt = true, false end
         RAP.own("ex.dt", R.dt, want_dt)
         RAP.own("ex.hs", R.hs, want_hs)
-        -- auto recharge
-        if RAP.v("it.recharge") and R.dt and not charged and not W.threat and R.on(R.dt) then pcall(rage.exploit.force_charge, rage.exploit) end
+        -- auto recharge (в ideal tick перезарядкой управляет его модуль: сразу после возврата за укрытие)
+        if RAP.v("it.recharge") and not it_on and R.dt and not charged and not W.threat and R.on(R.dt) then pcall(rage.exploit.force_charge, rage.exploit) end
         -- air teleport
         if RAP.v("it.at") and charged and (not on_ground) and globals.tickcount % U.max(1, RAP.v("it.at_int") or 12) == 0 then
             if not RAP.v("it.at_vis") or hittable_after_jump(me) then
@@ -4829,7 +4839,8 @@ do
     RAP.on("ind_rows", "exploits", function(add)
         if S.it_on then
             local ch = RAP.W.charge or 0
-            add(string.format("IDEAL TICK %d%%", U.floor(U.clamp(ch, 0, 1) * 100)), ch >= 1 and color(255, 230, 140) or color(255, 150, 110), 1)
+            local st = RAP.it and RAP.it.st or "?"
+            add(string.format("IDEAL TICK: %s %d%%", st, U.floor(U.clamp(ch, 0, 1) * 100)), ch >= 1 and color(255, 230, 140) or color(255, 150, 110), 1)
         end
         if S.brk then add("BREAK LC", color(160, 255, 200), 2) end
         if S.mk then add("MAGIC KEY", color(255, 120, 200), 1) end
@@ -4837,6 +4848,177 @@ do
         if S.js then add("JUMP SCOUT", color(200, 220, 255), 3) end
         if until_ok(globals.curtime, S.os_until, 0.2) then add("AUTO OS", color(200, 200, 255), 3) end
     end)
+end
+---------------------------------------------------------------- ideal tick: пик -> выстрел -> телепорт назад -> перезарядка
+-- Спецификация владельца: пока зажата клавиша ideal tick - freestanding и заряженный DT; пикаешь, рагебот стреляет,
+-- СРАЗУ после выстрела оставшиеся тики эксплойта уходят на телепорт назад к стартовой точке (за укрытие), там
+-- эксплойт перезаряжается как можно быстрее. Состояния: READY -> PEEK -> SHOT -> TELEPORT -> RETURN -> RECHARGE.
+--   SHOT: выстрел смертелен по оценке чита (aim_fire.damage >= HP), оружие однозарядное (scout / AWP / R8) или DT
+--         выключен / не заряжен -> телепорт через it.tp_off тиков; иначе ждем вторую пулю DT до it.tp_wait тиков.
+--   TELEPORT: в этом тике движение к стартовой точке + rage.exploit:force_teleport() (если заряд остался).
+--   RETURN: идем к старту (<= 1 с), peek assist чита тоже включен на все время ideal tick.
+--   RECHARGE: враг не может попасть и цель не видна -> force_charge; пока открыт - зарядка блокируется
+--             (allow_charge(false), не дольше 1.5 с), чтобы не "застрять" в перезарядке на виду.
+-- Не проверено в документации: точная механика force_teleport / force_charge (описаны только сигнатуры) - каждый
+-- цикл пишется в /eclipse it (тики от выстрела до телепорта, был ли телепорт, заряд), это и есть проверка в игре.
+do
+    local U, R = RAP.U, RAP.ref
+    local SINGLE = { [40] = true, [9] = true, [64] = true }        -- scout / AWP / R8: DT второй пулей не стреляет
+    local IT = { st = "OFF", log = {}, blocked = false }
+    RAP.it = IT
+    local function charge() local ok, c = pcall(rage.exploit.get, rage.exploit); return (ok and type(c) == "number") and c or 0 end
+    local function set_state(st)
+        if IT.st ~= st then IT.st, IT.st_tick, IT.st_rt = st, globals.tickcount, globals.realtime end
+    end
+    local function block_charge(v)
+        if v == IT.blocked then return end
+        if pcall(rage.exploit.allow_charge, rage.exploit, not v) then IT.blocked = v end
+    end
+    function IT.release()
+        block_charge(false)
+        if IT.st ~= "OFF" then IT.st, IT.start, IT.cyc = "OFF", nil, nil end
+    end
+    local function push_log(c)
+        IT.log[#IT.log + 1] = c
+        if #IT.log > 20 then table.remove(IT.log, 1) end
+    end
+    local function finish(reason)
+        local c = IT.cyc
+        if c and not c.done then c.done, c.end_reason = true, reason; push_log(c) end
+        IT.cyc = nil
+    end
+    local function move_to(cmd, me, pos)
+        local org = me:get_origin()
+        pcall(U.setf, cmd, "move_yaw", org:to(pos):angles().y)
+        pcall(U.setf, cmd, "forwardmove", 450); pcall(U.setf, cmd, "sidemove", 0)
+        for _, k in ipairs({ "in_forward", "in_back", "in_moveleft", "in_moveright", "in_speed", "in_duck" }) do pcall(U.setf, cmd, k, false) end
+    end
+    local function target_alive(c)
+        if not c.target then return false end
+        local ok, a = pcall(c.target.is_alive, c.target)
+        return ok and a and true or false
+    end
+
+    -- выстрел (каждая пуля DT - отдельный aim_fire)
+    RAP.on("our_fire", "ideal tick", function(rec, e)
+        if IT.st == "OFF" then return end
+        local now_t = globals.tickcount
+        if IT.st == "SHOT" and IT.cyc then
+            IT.cyc.shots = IT.cyc.shots + 1
+            IT.cyc.second_tick = now_t
+            return
+        end
+        if IT.st ~= "READY" and IT.st ~= "PEEK" then return end
+        local W = RAP.W
+        local hp = 100
+        if e and e.target then local okh, h = pcall(U.getf, e.target, "m_iHealth"); if okh and type(h) == "number" then hp = h end end
+        local ch = charge()
+        local can_dt = R.on(R.dt) and ch >= 1 and not (W.widx and SINGLE[W.widx])
+        IT.cyc = { shot_tick = now_t, shot_rt = globals.realtime, shots = 1, target = e and e.target, idx = rec.idx, est = e and e.damage or 0,
+            hp = hp, lethal = (e and (e.damage or 0) >= hp) or false, can_dt = can_dt, ch_shot = ch, wgroup = W.wgroup }
+        set_state("SHOT")
+    end)
+
+    RAP.on("tick", "ideal tick", function(cmd)
+        local W = RAP.W
+        local on = W.alive and RAP.v("it.on") and RAP.v("it.key")
+        if not on then
+            if IT.st ~= "OFF" then finish("key released"); IT.release() end
+            RAP.own("it.ap", R.peek_assist, nil)
+            return
+        end
+        local me = W.me
+        local org = me:get_origin()
+        local tp_on = RAP.v("it.tp")
+        -- peek assist чита (возврат) - на все время ideal tick, если включен телепорт назад или старый пункт it.ap
+        RAP.own("it.ap", R.peek_assist, (tp_on or RAP.v("it.ap")) and true or nil)
+        local ch = charge()
+        local now_t, rt = globals.tickcount, globals.realtime
+        if IT.st == "OFF" then
+            IT.start = org:clone()
+            IT.exposed_since = nil
+            set_state(ch >= 1 and "READY" or "RECHARGE")
+        end
+        local exposed = W.can_hit_me ~= nil
+        if exposed then IT.exposed_since = IT.exposed_since or rt else IT.exposed_since = nil end
+        local dist = org:dist2d(IT.start)
+        local st = IT.st
+        if st == "READY" then
+            if ch < 1 then set_state("RECHARGE")
+            elseif dist > 8 then set_state("PEEK") end
+        elseif st == "PEEK" then
+            if ch < 1 then set_state("RECHARGE")
+            elseif dist <= 8 and not exposed then set_state("READY") end
+            -- defensive на пике: голова уходит, пока враг может попасть (нужен полный заряд DT - docs)
+            if exposed and ch >= 1 and RAP.v("it.def") then pcall(U.setf, cmd, "force_defensive", true) end
+        elseif st == "SHOT" then
+            local c = IT.cyc
+            local waited = now_t - c.shot_tick
+            local off = RAP.v("it.tp_off") or 1
+            local need_second = c.can_dt and not c.lethal and c.shots < 2 and target_alive(c)
+            local go = waited < 0 or (not need_second and waited >= off) or (need_second and waited >= (RAP.v("it.tp_wait") or 3))
+            if go then
+                if not tp_on then
+                    c.teleported = false; c.why = "teleport off"
+                    set_state("RETURN")
+                else
+                    move_to(cmd, me, IT.start)
+                    local ch_tp = ch
+                    c.tp_tick, c.ch_tp = now_t, ch_tp
+                    if ch_tp > 0 then
+                        local okt = pcall(rage.exploit.force_teleport, rage.exploit)
+                        c.teleported = okt
+                        c.why = c.lethal and "lethal shot" or (c.shots >= 2 and "after 2nd DT bullet" or (c.can_dt and "2nd bullet not needed / timeout" or "single-shot weapon"))
+                    else
+                        c.teleported = false; c.why = "no charge left (DT used it)"
+                    end
+                    c.dist_before = dist
+                    set_state("RETURN")
+                end
+            end
+        elseif st == "RETURN" then
+            local c = IT.cyc
+            if c and c.tp_tick and not c.dist_after and now_t - c.tp_tick >= 1 then c.dist_after = dist end
+            if dist <= 8 or rt - (IT.st_rt or rt) > 1 then
+                if c then c.returned = dist <= 8; c.ret_ms = U.round((rt - (c.shot_rt or rt)) * 1000) end
+                set_state(ch >= 1 and "READY" or "RECHARGE")
+                if ch >= 1 then finish("ready") end
+            else
+                move_to(cmd, me, IT.start)
+            end
+        elseif st == "RECHARGE" then
+            if ch >= 1 then
+                if IT.cyc then IT.cyc.rech_ms = U.round((rt - (IT.st_rt or rt)) * 1000) end
+                finish("recharged")
+                set_state(dist > 8 and "PEEK" or "READY")
+            end
+        end
+        -- политика перезарядки: не заряжаться на виду (максимум 1.5 с), за укрытием - сразу
+        local recharging = (IT.st == "RECHARGE" or IT.st == "RETURN") and ch < 1
+        local safe = not exposed
+        if recharging and RAP.v("it.safe_charge") and exposed and IT.exposed_since and rt - IT.exposed_since < 1.5 then
+            block_charge(true)
+        else
+            block_charge(false)
+            if recharging and safe and IT.st == "RECHARGE" then pcall(rage.exploit.force_charge, rage.exploit) end
+        end
+    end, 46)
+    RAP.on("level", "ideal tick", function() IT.release() end)
+    RAP.on("round", "ideal tick", function() finish("round start"); IT.release() end)
+    RAP.on("shutdown", "ideal tick", function() IT.release() end)
+    RAP.cmd.it = function()
+        print(string.format("[it] state %s | charge %.0f%% | charge blocked: %s | start %s", IT.st, charge() * 100, tostring(IT.blocked),
+            IT.start and string.format("%.0f %.0f", IT.start.x, IT.start.y) or "-"))
+        if #IT.log == 0 then print("[it] no ideal tick cycles yet (hold the key, peek, shoot)") end
+        for _, c in ipairs(IT.log) do
+            print(string.format("[it] %-6s est %3d/%3d hp%s | bullets %d | shot->tp %s t | teleport %s (%s) | charge shot %.0f%% tp %s | moved %s u | back %s in %s ms | recharge %s ms | end: %s",
+                tostring(c.wgroup), U.round(c.est or 0), c.hp or 0, c.lethal and " LETHAL" or "", c.shots,
+                c.tp_tick and tostring(c.tp_tick - c.shot_tick) or "-", c.teleported and "YES" or "no", tostring(c.why or "-"),
+                (c.ch_shot or 0) * 100, c.ch_tp and string.format("%.0f%%", c.ch_tp * 100) or "-",
+                (c.dist_before and c.dist_after) and string.format("%.0f", c.dist_before - c.dist_after) or "-",
+                c.returned and "yes" or "no", tostring(c.ret_ms or "-"), tostring(c.rech_ms or "-"), tostring(c.end_reason)))
+        end
+    end
 end
 ---------------------------------------------------------------- dormant aimbot (скрипт): стрельба по врагу за стеной по ESP-данным
 -- Цель - dormant-игрок со свежей позицией (ESP). Урон - trace_bullet в точку тела, шанс попадания - выборка разброса
@@ -5690,7 +5872,9 @@ do
         if arg == "release" then
             RAP.arb.release(); RAP.aa_release(); RAP.own_release_all()
             if RAP.pressure and RAP.pressure.release_ds then RAP.pressure.release_ds() end
+            if RAP.it and RAP.it.release then RAP.it.release() end
             local left = 0
+            if RAP.it and RAP.it.blocked then left = left + 1 end
             if RAP.pressure and RAP.pressure.ds_owned and RAP.pressure.ds_owned() then left = left + 1 end
             for _, v in pairs(RAP.arb.owned) do if v then left = left + 1 end end
             for _, v in pairs(RAP.aa_owned()) do if v then left = left + 1 end end
@@ -5750,12 +5934,15 @@ do
         if RAP.pressure and RAP.pressure.ds_owned and RAP.pressure.ds_owned() then own[#own + 1] = "Delay Shot=off (rage.delay)" end
         table.sort(own)
         print("[why] other cheat items held by the script: " .. (#own > 0 and table.concat(own, ", ") or "none"))
+        if RAP.it and RAP.it.st ~= "OFF" then
+            print(string.format("[why] ideal tick: %s, exploit charge blocked: %s (details: /eclipse it)", RAP.it.st, tostring(RAP.it.blocked)))
+        end
     end
     C.help = function()
         print("[eclipse] " .. RAP.VERSION .. " - console commands (/eclipse <command>):")
         print("[eclipse]   selftest [release]  health  perf [sec]  why  strat  ai  evo  evolve  decisions [n]  journal [n]")
         print("[eclipse]   report  coach  deaths  shots  peek  replay [aa | strategy.x=v ...]  cfg [path value | reset]")
-        print("[eclipse]   db [reset <part>]  save  reset_ai")
+        print("[eclipse]   db [reset <part>]  save  reset_ai  it (ideal tick cycles)")
     end
     C.brain = function() RAP.cmd.strat() end
     C.cfg = function(arg)

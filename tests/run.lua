@@ -293,6 +293,79 @@ test("render after an enemy entity became invalid: no module errors, stale snaps
     for k, e in pairs(RAP.U.errors) do if k:find("^frame") or k:find("esp") then error(k .. ": " .. tostring(e.msg)) end end
 end)
 
+-- ideal tick: общая подготовка сцены
+local function it_scene()
+    local E = S.load(PATH)
+    local RAP = E.RAP
+    local pos = vec(0, 0, 0)
+    local wpn = { m_flNextPrimaryAttack = 0, m_iClip1 = 5, get_weapon_index = function() return 11 end }   -- auto
+    local me = S.player({ idx = 1, m_MoveType = 2, get_player_weapon = function() return wpn end,
+        get_eye_position = function() return pos + vec(0, 0, 64) end, get_origin = function() return pos:clone() end })
+    local enemy = S.player({ idx = 3, get_origin = function() return vec(800, 0, 0) end })
+    local X = { charge = 1, tp = 0, fc = 0, allow = {}, exposed = false }
+    rage.exploit = { get = function() return X.charge end, force_teleport = function() X.tp = X.tp + 1 end,
+        force_charge = function() X.fc = X.fc + 1 end, allow_charge = function(_, v) X.allow[#X.allow + 1] = v end }
+    entity.get_local_player = function() return me end
+    entity.get_players = function(_, _, cb) cb(enemy) end
+    entity.get_threat = function(h) if h then return X.exposed and enemy or nil end return enemy end
+    RAP.ref.dt:set(true)
+    RAP.cfg["it.on"]:set(true); RAP.cfg["it.key"]:set(true)
+    local function tick() E.T.tick = E.T.tick + 1; E.T.now = E.T.now + 1 / 64; E.T.real = E.T.real + 1 / 64
+        local cmd = { choked_commands = 0, view_angles = vec(), forwardmove = 0, sidemove = 0 }
+        E.fire("createmove", cmd); return cmd end
+    local function shoot(dmg, hp) enemy.m_iHealth = hp
+        E.fire("aim_fire", { id = E.T.tick, target = enemy, damage = dmg, hitchance = 80, hitgroup = 1 }) end
+    return E, RAP, X, function(p2) pos = p2 end, tick, shoot
+end
+
+test("ideal tick: lethal shot -> teleport back next tick -> recharge only when safe -> ready", function()
+    local E, RAP, X, setpos, tick, shoot = it_scene()
+    tick()
+    assert(RAP.it.st == "READY", RAP.it.st)
+    setpos(vec(40, 0, 0)); X.exposed = true; tick()
+    assert(RAP.it.st == "PEEK", RAP.it.st)
+    shoot(120, 100)
+    assert(RAP.it.st == "SHOT")
+    local cmd = tick()                                  -- it.tp_off = 1
+    assert(X.tp == 1, "no teleport")
+    assert(RAP.it.st == "RETURN" and math.abs(cmd.move_yaw - 180) < 1 and cmd.forwardmove == 450, "not moving back to start")
+    X.charge = 0; setpos(vec(2, 0, 0)); tick()
+    assert(RAP.it.st == "RECHARGE", RAP.it.st)
+    tick()
+    assert(X.allow[#X.allow] == false, "charge must be blocked while exposed")
+    X.exposed = false; tick()
+    assert(X.allow[#X.allow] == true and X.fc >= 1, "no recharge in cover")
+    X.charge = 1; tick()
+    assert(RAP.it.st == "READY", RAP.it.st)
+    local c = RAP.it.log[#RAP.it.log]
+    assert(c and c.teleported and c.lethal and c.tp_tick - c.shot_tick == 1, "cycle not logged")
+    E.console("/eclipse it")
+    no_errors(E)
+end)
+
+test("ideal tick: non-lethal DT shot waits for the 2nd bullet before teleporting", function()
+    local _, RAP, X, setpos, tick, shoot = it_scene()
+    tick(); setpos(vec(40, 0, 0)); tick()
+    shoot(40, 100)
+    tick()
+    assert(X.tp == 0 and RAP.it.st == "SHOT", "teleported before the 2nd DT bullet")
+    shoot(40, 60)                                       -- вторая пуля DT
+    tick()
+    assert(X.tp == 1 and RAP.it.log ~= nil, "no teleport after the 2nd bullet")
+    assert(RAP.it.cyc.shots == 2)
+end)
+
+test("ideal tick: releasing the key releases charge block and peek assist", function()
+    local E, RAP, X, setpos, tick, shoot = it_scene()
+    tick(); setpos(vec(40, 0, 0)); X.exposed = true; tick()
+    shoot(120, 100); tick(); X.charge = 0; tick(); tick()
+    assert(RAP.it.blocked == true)
+    RAP.cfg["it.key"]:set(false); tick()
+    assert(RAP.it.blocked == false and RAP.it.st == "OFF", "not released")
+    assert(RAP.own_list()["it.ap"] == nil, "peek assist still owned")
+    no_errors(E)
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP
