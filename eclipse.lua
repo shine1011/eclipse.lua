@@ -662,7 +662,7 @@ do
         EN_LIST[EN_N] = r
     end
     function W.update(cmd)
-        W.now, W.cmd = globals.curtime, cmd
+        W.now, W.cmd, W.upd_rt = globals.curtime, cmd, globals.realtime
         local me = entity.get_local_player()
         W.me, W.alive = me, me and me:is_alive() or false
         if not W.alive then
@@ -691,6 +691,20 @@ do
         W.enemies = EN_LIST
     end
     RAP.on("tick", "world", function(cmd) W.update(cmd) end, 0)
+    -- Снимок мира обновляется только в createmove. Когда createmove не идет (смерть, смена карты, выход с сервера),
+    -- кадры отрисовки видели бы старые сущности: "entity is invalid" в effects / панелях. Снимок старше 0.25 с
+    -- (или с прошлой карты) сбрасывается в начале кадра.
+    local function drop_snapshot()
+        for i = #EN_LIST, 1, -1 do EN_LIST[i] = nil end
+        for k in pairs(EN_REC) do EN_REC[k] = nil end
+        W.enemies, W.threat, W.can_hit_me, W.alive, W.me, W.weapon = EN_LIST, nil, nil, false, nil, nil
+    end
+    W.drop_snapshot = drop_snapshot
+    RAP.on("frame", "world", function()
+        local rt = globals.realtime
+        if W.upd_rt and (rt - W.upd_rt > 0.25 or rt < W.upd_rt) then W.upd_rt = nil; drop_snapshot() end
+    end, 0)
+    RAP.on("level", "world snapshot", function() W.upd_rt = nil; drop_snapshot() end)
 end
 ---------------------------------------------------------------- shots: выстрелы врагов по тебе и твои выстрелы
 -- Выстрел врага собирается из трех событий в любом порядке (на живом сервере bullet_fire приходит до 0.6 с позже
@@ -4270,6 +4284,23 @@ do
     end)
     RAP.on("round", "effects", function() KF.n = 0 end)
 
+    local function esp_label(en, fs)
+        if not en.ent:is_alive() then return end
+        local aat = RAP.aat.type(en.idx)
+        if not aat then return end
+        local o = en.ent:get_origin()
+        local ok, sp = pcall(render.world_to_screen, vector(o.x, o.y, o.z + 84))
+        if not ok or not sp then return end
+        local t = RAP.strat.T[en.idx]
+        local txt = aat:upper() .. (t and ("  " .. RAP.strat.ARMS[t.arm]:lower()) or "")
+        local cr = en.pid and RAP.strat.corr[en.pid] or 0
+        if cr >= 2 then txt = txt .. string.format("  miss x%d", U.round(cr)) end
+        local w = T.measure(fs, txt) + 10
+        local col = aat == "jitter" and color(255, 170, 90) or (aat == "wide" and color(255, 120, 120) or color(150, 220, 150))
+        render.rect(vector(sp.x - w / 2, sp.y - 7), vector(sp.x + w / 2, sp.y + 7), color(14, 14, 20, 170), 4)
+        render.rect(vector(sp.x - w / 2, sp.y - 7), vector(sp.x - w / 2 + 2, sp.y + 7), col, 1)
+        render.text(fs, vector(sp.x + 1, sp.y - 6), color(235, 235, 240, 230), "c", txt)
+    end
     local function draw()
         local sz, now = render.screen_size(), globals.realtime
         local cx, cy = U.floor(sz.x * 0.5), U.floor(sz.y * 0.5)
@@ -4334,23 +4365,11 @@ do
         if RAP.v("fx.esp") then
             local fs = T.font("fx_e", "Verdana", 10, "ad", 1)
             for _, en in ipairs(RAP.W.enemies or {}) do
-                if not en.dormant and en.ent:is_alive() then
-                    local aat = RAP.aat.type(en.idx)
-                    if aat then
-                        local o = en.ent:get_origin()
-                        local ok, sp = pcall(render.world_to_screen, vector(o.x, o.y, o.z + 84))
-                        if ok and sp then
-                            local t = RAP.strat.T[en.idx]
-                            local txt = aat:upper() .. (t and ("  " .. RAP.strat.ARMS[t.arm]:lower()) or "")
-                            local cr = en.pid and RAP.strat.corr[en.pid] or 0
-                            if cr >= 2 then txt = txt .. string.format("  miss x%d", U.round(cr)) end
-                            local w = T.measure(fs, txt) + 10
-                            local col = aat == "jitter" and color(255, 170, 90) or (aat == "wide" and color(255, 120, 120) or color(150, 220, 150))
-                            render.rect(vector(sp.x - w / 2, sp.y - 7), vector(sp.x + w / 2, sp.y + 7), color(14, 14, 20, 170), 4)
-                            render.rect(vector(sp.x - w / 2, sp.y - 7), vector(sp.x - w / 2 + 2, sp.y + 7), col, 1)
-                            render.text(fs, vector(sp.x + 1, sp.y - 6), color(235, 235, 240, 230), "c", txt)
-                        end
-                    end
+                -- v55: сущность могла стать недействительной между тиком и кадром (игрок вышел) - каждая подпись
+                -- отдельно под U.safe, иначе одна ошибка "entity is invalid" обрывала весь кадр эффектов
+                if not en.dormant then
+                    local ok, err = pcall(esp_label, en, fs)
+                    if not ok and not tostring(err):find("invalid", 1, true) then U.safe("esp label", error, err, 0) end
                 end
             end
         end
@@ -4438,7 +4457,11 @@ do
     RAP.on("frame", "debug panel", function()
         if not RAP.v("vis.debug") or not RAP.wid or not RAP.wid.list_panel then return end
         local now = globals.realtime
-        if now - D.t > 0.25 then D.t, D.rows = now, build() end
+        if now - D.t > 0.25 then
+            D.t = now
+            local okb, rows = pcall(build)            -- цель могла стать недействительной сущностью (вышла с сервера)
+            if okb then D.rows = rows end
+        end
         RAP.wid.list_panel("debug", "RAP DEBUG", D.rows, 300)
     end, 55)
 end

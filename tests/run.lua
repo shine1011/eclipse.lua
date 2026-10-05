@@ -256,6 +256,30 @@ test("selftest reports whether your hitchance is readable under override", funct
     assert(has_line(E, "readable under override: yes: menu 60, override 72"))
 end)
 
+test("render after an enemy entity became invalid: no module errors, stale snapshot dropped", function()
+    local E = S.load(PATH)
+    local RAP = E.RAP
+    local gone = false
+    local function chk() if gone then error("entity is invalid.", 0) end end
+    local enemy = S.player({ idx = 3, get_origin = function() chk(); return vec(500, 0, 0) end,
+        get_anim_state = function() chk(); return { eye_yaw = 10, abs_yaw = 0 } end })
+    enemy.is_alive = function() chk(); return true end
+    enemy.get_index = function() return 3 end
+    local me = S.player({ idx = 1, get_player_weapon = function() return nil end, get_eye_position = function() return vec(0, 0, 64) end,
+        get_origin = function() return vec() end })
+    entity.get_local_player = function() return me end
+    entity.get_players = function(_, _, cb) cb(enemy) end
+    entity.get_threat = function() return enemy end
+    RAP.cfg["vis.debug"]:set(true)
+    for _ = 1, 20 do E.T.tick = E.T.tick + 1; E.fire("createmove", { choked_commands = 0, view_angles = vec() }) end
+    gone = true
+    E.fire("render")                                -- тот же кадр: снимок свежий, сущность уже недействительна
+    E.T.real = E.T.real + 1
+    E.fire("render")                                -- createmove не шел 1 с: снимок сбрасывается
+    assert(#RAP.W.enemies == 0 and RAP.W.threat == nil, "stale snapshot kept")
+    for k, e in pairs(RAP.U.errors) do if k:find("^frame") or k:find("esp") then error(k .. ": " .. tostring(e.msg)) end end
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP
