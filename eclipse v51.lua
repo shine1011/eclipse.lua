@@ -2430,6 +2430,10 @@ do
         return b
     end
 
+    -- константы горячего пути (раньше таблицы-литералы создавались каждый тик)
+    local WAY5, WAY3 = { -0.5, -0.25, 0, 0.25, 0.5 }, { -90, 180, 90 }
+    local NO_OPTS, OPT_JITTER, OPT_OVERLAP = {}, { "Jitter" }, { "Avoid Overlap" }
+
     local function tick_flip(c)
         S.left = S.left - 1
         if S.left <= 0 then
@@ -2451,7 +2455,7 @@ do
             return off + S.ro, S.flip
         end
         if mode == "3-Way" then local i = n % 3; return off + (i == 0 and -rng / 2 or (i == 2 and rng / 2 or 0)), n % 2 == 0 end
-        if mode == "5-Way" then return off + ({ -0.5, -0.25, 0, 0.25, 0.5 })[n % 5 + 1] * rng, n % 2 == 0 end
+        if mode == "5-Way" then return off + WAY5[n % 5 + 1] * rng, n % 2 == 0 end
         if mode == "Staged" then local k = U.max(2, c.stages or 4); return off + ((n % k) / (k - 1) - 0.5) * rng, n % 2 == 0 end
         local s = math.sin(globals.curtime * 3)
         return off + s * rng / 2, s > 0
@@ -2476,7 +2480,7 @@ do
             elseif dy == "Opposite" then v = U.rand(150, 210)
             elseif dy == "Opposite jitter" then v = flip and U.rand(135, 180) or U.rand(180, 225)
             elseif dy == "Side-based" then v = flip and U.rand(-105, -75) or U.rand(75, 105)
-            elseif dy == "3-Way" then v = ({ -90, 180, 90 })[n % 3 + 1]
+            elseif dy == "3-Way" then v = WAY3[n % 3 + 1]
             elseif dy == "5-Way" or dy == "Ways custom" then v = WAYS[n % 5 + 1] end
             if v then pcall(rage.antiaim.override_hidden_yaw_offset, rage.antiaim, U.norm(v)) end
         end
@@ -2617,7 +2621,7 @@ do
             set("enabled", true); set("pitch", "Disabled")
             set("yaw", "Backward"); set("base", "Local View"); set("offset", 180)
             set("modifier", "Disabled"); set("mod_offset", 0)
-            set("body", true); set("left", 58); set("right", 58); set("body_opts", {}); set("body_fs", "Off")
+            set("body", true); set("left", 58); set("right", 58); set("body_opts", NO_OPTS); set("body_fs", "Off")
             set("freestand", false); set("fs_nomod", nil); set("fs_body", nil); set("hidden", false)
             AA.mode, AA.fs, AA.safe, AA.low = "legit", false, false, false
             return
@@ -2667,7 +2671,7 @@ do
         end
         set("offset", U.norm(yaw))
         if S.manual ~= 0 then
-            set("body", true); set("left", 60); set("right", 60); set("body_opts", { "Avoid Overlap" }); set("body_fs", "Off")
+            set("body", true); set("left", 60); set("right", 60); set("body_opts", OPT_OVERLAP); set("body_fs", "Off")
             pcall(rage.antiaim.inverter, rage.antiaim, false)
         else
             local L, R = c.left or 58, c.right or 58
@@ -2681,8 +2685,8 @@ do
                 AA.lim = true
             else AA.lim = false end
             set("body", true); set("left", L); set("right", R); set("body_fs", c.bfs or "Off")
-            if native and not sj then set("body_opts", { "Jitter" })
-            else set("body_opts", {}); pcall(rage.antiaim.inverter, rage.antiaim, flip) end
+            if native and not sj then set("body_opts", OPT_JITTER)
+            else set("body_opts", NO_OPTS); pcall(rage.antiaim.inverter, rage.antiaim, flip) end
         end
         -- freestanding
         -- ideal tick "freestanding on peek" решается здесь же, а не в exploits: иначе два модуля
@@ -5029,10 +5033,19 @@ do
         local W = RAP.W
         if not W.alive then reset(); return end
         local me, now = W.me, globals.curtime
-        for _, en in ipairs(W.enemies) do
-            if not en.dormant then local o = en.ent:get_origin(); if o then SEEN[en.idx] = { t = now, org = o:clone(), duck = en.ent.m_flDuckAmount or 0 } end end
-        end
+        -- v52: позиции копятся только при включенном AI Peek и обновляются на месте (раньше - новая таблица на
+        -- каждого видимого врага каждый тик, даже с выключенной функцией)
         if not RAP.v("peek.on") then reset("off"); return end
+        for _, en in ipairs(W.enemies) do
+            if not en.dormant then
+                local o = en.ent:get_origin()
+                if o then
+                    local sv = SEEN[en.idx]
+                    if not sv then sv = {}; SEEN[en.idx] = sv end
+                    sv.t, sv.org, sv.duck = now, o:clone(), en.ent.m_flDuckAmount or 0
+                end
+            end
+        end
         if not RAP.v("peek.key") then if PK.st ~= 0 then finish(PK.seen and "empty_vis" or "empty_dorm"); reset() end; PK.reason = "hold the AI Peek key"; return end
         if me.m_MoveType ~= 2 then reset("not walking"); return end
         local org = me:get_origin()
