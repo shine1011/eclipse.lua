@@ -386,10 +386,15 @@ end
 -- Каждый тик модули голосуют: RAP.vote(key, value, prio, source). Побеждает наибольший prio. value = false -
 -- "явно оставить настройку пользователя" (голос против переопределения). Бинд пользователя на пункт главнее всего.
 do
-    local A = { votes = {}, owned = {}, last = {}, why = {} }
+    -- v52: голоса - одна переиспользуемая запись на пункт (slot) с номером прохода gen; раньше новая таблица на
+    -- каждый голос каждый тик и A.votes = {} на каждом commit. A.votes - вид только на голоса текущего тика.
+    local slot, gen = {}, 1
+    local A = { owned = {}, last = {}, why = {} }
+    A.votes = setmetatable({}, { __index = function(_, k) local v = slot[k]; if v and v.gen == gen then return v end end })
     function RAP.vote(key, value, prio, source)
-        local v = A.votes[key]
-        if not v or prio > v.prio then A.votes[key] = { value = value, prio = prio, src = source } end
+        local v = slot[key]
+        if not v then v = { gen = 0 }; slot[key] = v end
+        if v.gen ~= gen or prio > v.prio then v.value, v.prio, v.src, v.gen = value, prio, source, gen end
     end
     setmetatable(A, { __index = function(t, k) if k == "votes_now" then return t.votes end end })
     function A.commit()
@@ -418,7 +423,7 @@ do
             end
             w.value, w.src = val, wsrc
         end
-        A.votes = {}
+        gen = gen + 1
     end
     function A.release()
         for key, P in pairs(RAP.ref.rage) do if A.owned[key] then P.set_override(nil); A.owned[key] = false end end
