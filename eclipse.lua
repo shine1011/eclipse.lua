@@ -190,7 +190,8 @@ do
             rollback = 1,          -- 1 = откатывать смены с вердиктом "хуже", 0 = только записывать
         },
         shots = { near = 60, inacc_drop = 0.4 },
-        peek = { scan_ms = 1.5 },        -- AI Peek: время скана за тик (мс), остаток направлений - на следующих тиках
+        peek = { scan_ms = 1.5 },
+        aa_ai = { explore_far = 1500, peek_speed = 100 },   -- v58: эксперимент / Evo-испытание только против врага дальше этого и когда ты не пикаешь        -- AI Peek: время скана за тик (мс), остаток направлений - на следующих тиках
         dormant = { hit_radius = 16 },   -- радиус (юниты) вокруг точки, попадание в который считается попаданием (оценка HC)
         log = { keep = 600 },      -- выстрелов в журнале (для сравнения версий)
         db = { schema = 50 },
@@ -1453,6 +1454,8 @@ do
                     prof = AA.cur and AA.cur.name or "-", grp = AA.group or "?", st = W.state or "?", side = AA.flip and "R" or "L",
                     def = (AA.def and globals.curtime >= AA.def and globals.curtime - AA.def < 0.3) and 1 or 0, dt = (W.charge or 0) >= 1 and 1 or 0,
                     brute = AA.brute and 1 or 0, man = AA.manual or 0, spd = W.vel and U.round(W.vel:length2d()) or 0,
+                    how = (AA.guard and "guarded->best") or (RAP.ai and AA.group and RAP.ai.how[AA.group]) or "-", fs = AA.fs and 1 or 0,
+                    peek = (W.vel and W.vel:length2d() > 100) and 1 or 0,
                     dist = tc and tc.geo.dist and U.round(tc.geo.dist) or nil, eaat = tc and tc.aa.type or "?" }
                 DU.deaths[#DU.deaths + 1] = row
                 if #DU.deaths > 150 then table.remove(DU.deaths, 1) end
@@ -1511,6 +1514,7 @@ do
         U.log("deaths", "%d deaths: headshot %.0f%% | defensive active %.0f%% | DT charged %.0f%%", #rows, hs / #rows * 100, def / #rows * 100, dt / #rows * 100)
         cut(rows, "prof", "AA profile:"); cut(rows, "st", "your state:"); cut(rows, "side", "desync side:")
         cut(rows, "w", "enemy weapon:"); cut(rows, "eaat", "enemy AA:")
+        cut(rows, "how", "profile pick:"); cut(rows, "fs", "freestanding:"); cut(rows, "peek", "you peeking:")
     end
     RAP.cmd.deaths = function() DU.deaths_report() end
 end
@@ -2598,6 +2602,8 @@ do
     G.switch("aa.lowhp", "Low HP mode", false, { dep = on,
         tip = "At low HP any hit kills: freestanding (without jitter) while an enemy threatens you, and a 2x longer defensive-on-peek window." })
     G.slider("aa.lowhp_v", "Low HP threshold", 10, 100, 40, 1, nil, { dep = function() return on() and RAP.v("aa.lowhp") end, adv = true })
+    G.switch("aa.shot_reset", "Re-phase jitter on enemy shot", true, { dep = on,
+        tip = "Every shot of the current threat randomizes the jitter phase / side: resolvers that locked onto your period lose sync." })
 
     -- билдер: свои настройки на каждое состояние
     local B = RAP.menu.group("Anti-Aim", "Builder", 2)
@@ -2635,7 +2641,7 @@ do
         "Peek fake", "Delay 3" }, { dep = aon, tip = "Fewer profiles = faster learning: each profile needs several enemy shots to be judged. 5-7 is a good size." })
     A.switch("ai.merge", "Merge similar states (slow -> move, duck -> stand)", true, { dep = aon,
         tip = "3 groups instead of 5: every group gets more data, so the AI learns faster." })
-    A.slider("ai.explore", "Exploration (max)", 0, 100, 30, 1, "%", { dep = aon, adv = true,
+    A.slider("ai.explore", "Exploration (max)", 0, 100, 10, 1, "%", { dep = aon, adv = true,
         tip = "Upper limit. Real share depends on uncertainty: full with little data, 40% / 25% / 10% of it as the best profile gets confident." })
     A.slider("ai.min_life", "Min. profile lifetime", 2, 20, 6, 1, "s", { dep = aon, adv = true,
         tip = "A profile stays at least this long before a normal switch (panic can still switch earlier)." })
@@ -2652,6 +2658,8 @@ do
     A.slider("ai.evo_n", "Evo: events before judging", 6, 40, 12, 1, nil, { dep = aon, adv = true })
     A.slider("ai.evo_sigma", "Evo: mutation", 5, 60, 25, 1, "%", { dep = aon, adv = true })
     A.switch("ai.logs", "Log AI decisions", false, { dep = aon, adv = true })
+    A.switch("ai.explore_safe", "Explore only when safe", true, { dep = aon,
+        tip = "Experimental / new Evo profiles are used only against far enemies while you are not peeking; in a close duel the best profile is used." })
 end
 ---------------------------------------------------------------- AA-движок: профиль -> углы чита
 do
@@ -2893,6 +2901,19 @@ do
             end
         end
     end)
+    -- v58: выстрел текущей угрозы -> случайная фаза jitter (остаток задержки и сторона): резольвер, который подстроился
+    -- под период delay jitter, теряет синхронизацию. Только против угрозы, не чаще раза в 0.3 с.
+    RAP.on("enemy_fire", "aa shot reset", function(ent)
+        if not RAP.v("aa.shot_reset") or not AA.active or not AA.cur then return end
+        local thr = RAP.W.threat
+        if not thr or ent:get_index() ~= thr:get_index() then return end
+        local now = globals.realtime
+        if S.shot_reset_t and now - S.shot_reset_t < 0.3 and now >= S.shot_reset_t then return end
+        S.shot_reset_t = now
+        S.left = U.rand(1, U.max(1, AA.cur.delay or 2))
+        if U.rand(0, 1) == 1 then S.flip = not S.flip end
+        AA.rephase = (AA.rephase or 0) + 1
+    end)
     -- состояние на момент выстрела врага (для AI и hit-side memory)
     RAP.on("enemy_shot_start", "aa ctx", function(rec)
         rec.ctx.group = AA.group_of(RAP.W.state)
@@ -2942,6 +2963,21 @@ do
             c = builder(vs_sniper and "sniper" or W.state)
         else
             idx = RAP.ai and RAP.ai.current(group) or 9
+            -- v58: защита экспериментов. Экспериментальный / новый Evo-профиль - только когда безопасно: в близкой
+            -- дуэли (враг может попасть и ближе explore_far) или на пике ставится лучший профиль группы.
+            AA.guard = false
+            local how = RAP.ai and RAP.ai.how[group]
+            if (how == "explore" or how == "evo") and RAP.v("ai.explore_safe") and W.can_hit_me then
+                local K = RAP.CFG.aa_ai
+                local tcx = RAP.TC[W.can_hit_me:get_index()]
+                local dist = tcx and tcx.geo.dist or 0
+                local spd = W.vel and W.vel:length2d() or 0
+                if dist < K.explore_far or spd > K.peek_speed then
+                    local pid = RAP.W.pid(W.can_hit_me)
+                    local b = RAP.ai.best(group, nil, pid)
+                    if b and b ~= idx then idx, AA.guard = b, true end
+                end
+            end
             c = RAP.profiles.list[idx]
         end
         if AA.cur ~= c then S.flick_base = S.sent end
@@ -3056,6 +3092,7 @@ do
         if AA.brute then add("BRUTE", color(255, 140, 140), 3) end
         if AA.lim then add("LIMIT RND", color(220, 200, 255), 5) end
         if AA.inv then add("PHASE SHIFT", color(255, 200, 150), 4) end
+        if AA.guard then add("AA: SAFE PICK (no experiment in duel)", color(160, 255, 200), 4) end
         if AA.mode then add("AA: " .. AA.mode, color(160, 220, 255), 4) end
     end)
 end
@@ -4067,6 +4104,7 @@ do
             if A.fs then ov[#ov + 1] = "freestanding" end
             if A.brute then ov[#ov + 1] = "anti-brute (" .. tostring(A.brute_why or "-") .. ")" end
             if A.inv then ov[#ov + 1] = "phase shift" end
+            if A.guard then ov[#ov + 1] = "experiment guarded -> best profile (close duel / peek)" end
             if A.def and globals.curtime - A.def < 0.2 and globals.curtime >= A.def then ov[#ov + 1] = "defensive" end
             print("[why]    overrides on top of the profile: " .. (#ov > 0 and table.concat(ov, ", ") or "none"))
         end
@@ -5896,7 +5934,7 @@ do
             ["aa.lim"] = "After getting hit", ["aa.lim_min"] = 30, ["aa.def_peek"] = true, ["aa.def_peek_t"] = 200,
             ["aa.def_smart"] = true, ["aa.safe_head"] = true,
             ["ai.pool"] = { "Native A", "Native wide", "Native def", "Def flick", "Peek fake", "Delay 3" }, ["ai.merge"] = true,
-            ["ai.explore"] = 30, ["ai.memory"] = 95, ["ai.per_enemy"] = true, ["ai.side_mem"] = true, ["ai.panic"] = true,
+            ["ai.explore"] = 10, ["ai.explore_safe"] = true, ["ai.memory"] = 95, ["ai.per_enemy"] = true, ["ai.side_mem"] = true, ["ai.panic"] = true,
             ["ai.script_jit"] = true, ["ai.evo"] = true, ["ai.evo_n"] = 12, ["ai.evo_sigma"] = 25,
             ["fl.mode"] = "Adaptive", ["fl.max"] = 14, ["fl.min"] = 2,
             ["rage.on"] = true, ["rage.adapt"] = true, ["rage.hc_max"] = 78,
@@ -5914,13 +5952,13 @@ do
         },
         -- замена "AI Full Auto" из v23-v38: готовые стили
         ["Style: Balanced"] = { ["aa.on"] = true, ["aa.source"] = "AI (learns profiles)", ["aa.brute"] = "Smart (flip on hit)",
-            ["aa.lim"] = "After getting hit", ["aa.def_peek"] = true, ["ai.explore"] = 30, ["rage.adapt"] = true, ["rage.hc_max"] = 78,
+            ["aa.lim"] = "After getting hit", ["aa.def_peek"] = true, ["ai.explore"] = 10, ["rage.adapt"] = true, ["rage.hc_max"] = 78,
             ["st.on"] = true, ["fl.mode"] = "Adaptive", ["ex.brk"] = true },
         ["Style: Safe"] = { ["aa.on"] = true, ["aa.source"] = "AI (learns profiles)", ["aa.brute"] = "Smart (flip on hit)",
-            ["aa.lim"] = "Always", ["aa.def_peek"] = true, ["aa.safe_head"] = true, ["ai.explore"] = 20, ["rage.adapt"] = true,
+            ["aa.lim"] = "Always", ["aa.def_peek"] = true, ["aa.safe_head"] = true, ["ai.explore"] = 5, ["rage.adapt"] = true,
             ["rage.hc_max"] = 85, ["st.on"] = true, ["rs.low_body"] = true, ["rs.low_hp"] = 60, ["fl.mode"] = "Adaptive", ["ex.brk"] = true },
         ["Style: Aggressive"] = { ["aa.on"] = true, ["aa.source"] = "AI (learns profiles)", ["aa.brute"] = "Smart (flip on hit)",
-            ["aa.lim"] = "After getting hit", ["aa.def_peek"] = true, ["ai.explore"] = 45, ["rage.adapt"] = false, ["st.on"] = true,
+            ["aa.lim"] = "After getting hit", ["aa.def_peek"] = true, ["ai.explore"] = 20, ["rage.adapt"] = false, ["st.on"] = true,
             ["rs.low_body"] = false, ["fl.mode"] = "Fluctuate",
             ["ex.brk"] = true, ["it.recharge"] = true },
     }

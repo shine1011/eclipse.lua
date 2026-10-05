@@ -446,6 +446,31 @@ test("strategy reward: share of target HP (kill = 1), old hit stats only a weak 
     assert(ST.post(key, 2, "Auto", "jitter") > ST.post(key, 6, "Auto", "jitter"), "head kills must beat body chip damage")
 end)
 
+test("AA: experiment / evo profile is replaced by the best one in a close duel, kept vs far enemies", function()
+    local E = S.load(PATH)
+    local RAP = E.RAP
+    local far = false
+    local me = S.player({ idx = 1, get_player_weapon = function() return nil end, get_eye_position = function() return vec(0, 0, 64) end,
+        get_origin = function() return vec() end })
+    local enemy = S.player({ idx = 3, get_origin = function() return far and vec(3000, 0, 0) or vec(400, 0, 0) end, is_visible = function() return true end,
+        get_player_weapon = function() return nil end })
+    entity.get_local_player = function() return me end
+    entity.get_players = function(_, _, cb) cb(enemy) end
+    entity.get_threat = function() return enemy end
+    local AI = RAP.ai
+    local function run() for _ = 1, 8 do E.T.tick = E.T.tick + 1; E.T.now = E.T.now + 1 / 64; E.fire("createmove", { choked_commands = 0, view_angles = vec() }) end end
+    run()
+    local g = RAP.aa.group
+    local best = AI.best(g)
+    local other = best == 10 and 9 or 10
+    AI.cur[g], AI.how[g] = other, "explore"
+    run()
+    assert(RAP.aa.guard == true and RAP.aa.cur_index == best, "experiment used in a close duel")
+    far = true; run()
+    assert(RAP.aa.guard == false and RAP.aa.cur_index == other, "experiment blocked vs a far enemy")
+    no_errors(E)
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP
