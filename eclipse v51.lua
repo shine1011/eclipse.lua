@@ -2715,7 +2715,8 @@ do
     local P = RAP.profiles.list
     local KEY, OLD = "rap2_ai", "rage_aa_pro_ai_v11"
     -- since[g]: когда в группе включен текущий профиль; bdw["группа|оружие врага"]: увороты / попадания по классу оружия стрелка
-    local AI = { st = {}, en = {}, sm = {}, cur = {}, last_switch = {}, since = {}, hits = {}, bd = {}, ebd = {}, bdw = {}, gs = {} }
+    -- ets[pid]: когда враг последний раз учил per-enemy статистику (unixtime) - при сохранении остаются самые свежие
+    local AI = { st = {}, en = {}, sm = {}, cur = {}, last_switch = {}, since = {}, hits = {}, bd = {}, ebd = {}, bdw = {}, gs = {}, ets = {} }
     RAP.ai = AI
     local GROUPS = RAP.aa.GROUPS
 
@@ -2788,6 +2789,9 @@ do
                     AI.ebd[pid] = e
                 end
             end
+        end
+        if d and type(d.ets) == "table" then
+            for pid, t in pairs(d.ets) do if type(pid) == "string" and U.num(t, 0) then AI.ets[pid] = U.num(t, 0) end end
         end
         if not d and imported > 0 then print(string.format("[ai] imported learning from v38 for %d state group(s)", imported)) end
     end
@@ -2987,6 +2991,8 @@ do
             local x = e[g][i] or { n = 0, sum = 0 }
             x.n, x.sum = x.n * gamma + 1, x.sum * gamma + v
             e[g][i] = x
+            local okt, ut = pcall(common.get_unixtime)
+            if okt and tonumber(ut) then AI.ets[pid] = tonumber(ut) end
         end
         RAP.run("ai_reward", g, i, v, wgt)
     end
@@ -3151,20 +3157,29 @@ do
             end
         end
     end)
+    -- самые свежие враги (по AI.ets) из таблицы tbl, не больше cap; остальные удаляются и из памяти.
+    -- v52: раньше брались первые cap в порядке pairs(), то есть случайные - данные активных врагов терялись.
+    local function freshest(tbl, cap)
+        local l = {}
+        for pid in pairs(tbl) do
+            if RAP.W.learn(pid) then l[#l + 1] = pid else tbl[pid] = nil end
+        end
+        table.sort(l, function(a, b) return (AI.ets[a] or 0) > (AI.ets[b] or 0) end)
+        for k2 = cap + 1, #l do tbl[l[k2]] = nil end
+        if #l > cap then for k2 = cap + 1, #l do l[k2] = nil end end
+        return l
+    end
     RAP.on("save", "ai", function()
         if not RAP.v("main.persist") then return end
-        local en, n = {}, 0
-        for pid, e in pairs(AI.en) do
-            if n < 48 and RAP.W.learn(pid) then
-                n = n + 1
-                local out = {}
-                for g, l in pairs(e) do
-                    local t = {}
-                    for i, s in pairs(l) do if s.n > 0.05 then t[tostring(i)] = { U.round(s.n * 100) / 100, U.round(s.sum * 100) / 100 } end end
-                    out[g] = t
-                end
-                en[pid] = out
+        local en = {}
+        for _, pid in ipairs(freshest(AI.en, 48)) do
+            local out = {}
+            for g, l in pairs(AI.en[pid]) do
+                local t = {}
+                for i, s in pairs(l) do if s.n > 0.05 then t[tostring(i)] = { U.round(s.n * 100) / 100, U.round(s.sum * 100) / 100 } end end
+                out[g] = t
             end
+            en[pid] = out
         end
         -- phase shift: не больше 128 врагов, самые свежие
         local sm, sl = {}, {}
@@ -3175,17 +3190,20 @@ do
             sm[sl[k2][1]] = { h = s.h, d = s.d, inv = s.inv, ts = s.ts }
         end
         local function pack(row) local t = {}; for i, x in pairs(row) do if x[1] + x[2] > 0.05 then t[tostring(i)] = { U.round(x[1] * 100) / 100, U.round(x[2] * 100) / 100 } end end; return t end
-        local bd, ebd, k = {}, {}, 0
+        local bd, ebd = {}, {}
         for g, row in pairs(AI.bd) do bd[g] = pack(row) end
-        for pid, e in pairs(AI.ebd) do
-            if k < 64 and RAP.W.learn(pid) then k = k + 1; ebd[pid] = {}; for g, row in pairs(e) do ebd[pid][g] = pack(row) end end
+        for _, pid in ipairs(freshest(AI.ebd, 64)) do
+            ebd[pid] = {}
+            for g, row in pairs(AI.ebd[pid]) do ebd[pid][g] = pack(row) end
         end
         local bdw = {}
         for wk, row in pairs(AI.bdw) do bdw[wk] = pack(row) end
-        RAP.store.set(KEY, { st = AI.st, en = en, sm = sm, bd = bd, ebd = ebd, bdw = bdw })
+        local ets = {}
+        for pid, t in pairs(AI.ets) do if AI.en[pid] or AI.ebd[pid] then ets[pid] = t else AI.ets[pid] = nil end end
+        RAP.store.set(KEY, { st = AI.st, en = en, sm = sm, bd = bd, ebd = ebd, bdw = bdw, ets = ets })
     end)
     function AI.reset()
-        AI.st, AI.en, AI.sm, AI.cur, AI.bd, AI.ebd, AI.bdw, AI.since, AI.how = fresh_groups(), {}, {}, {}, {}, {}, {}, {}, {}
+        AI.st, AI.en, AI.sm, AI.cur, AI.bd, AI.ebd, AI.bdw, AI.since, AI.how, AI.ets = fresh_groups(), {}, {}, {}, {}, {}, {}, {}, {}, {}
         RAP.store.set(KEY, nil)
         print("[ai] AA learning reset")
     end
