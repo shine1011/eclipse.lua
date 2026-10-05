@@ -548,35 +548,45 @@ do
     local PISTOL = { [2] = true, [3] = true, [4] = true, [30] = true, [32] = true, [36] = true, [61] = true, [63] = true }
     W.STATES = { "stand", "move", "slow", "air", "airduck", "duck" }
 
+    -- v52: без замыканий на каждый вызов, автоматическое значение кэшируется на 0.5 с (W.ping зовется каждый тик)
+    local function nc_latency() local nc = utils.net_channel(); return nc.latency[0] + nc.latency[1] end
+    local function res_ping()
+        local p = entity.get_player_resource().m_iPing[entity.get_local_player():get_index()]
+        return (p and p > 0) and p / 1000 or nil
+    end
+    local PING = { t = -1, v = 0.06, src = "default" }
     function W.ping()
         local manual = RAP.v("main.ping")
         if manual and manual > 0 then return manual / 1000, "manual" end
-        local v
-        pcall(function() local nc = utils.net_channel(); v = nc.latency[0] + nc.latency[1] end)
-        if v and v >= 0.005 then return v, "net channel" end
-        pcall(function()
-            local p = entity.get_player_resource().m_iPing[entity.get_local_player():get_index()]
-            if p and p > 0 then v = p / 1000 end
-        end)
-        if v and v >= 0.005 then return v, "player resource" end
+        local now = globals.realtime
+        if now - PING.t < 0.5 and now >= PING.t then return PING.v, PING.src end
+        PING.t = now
+        local ok, v = pcall(nc_latency)
+        if ok and type(v) == "number" and v >= 0.005 then PING.v, PING.src = v, "net channel"; return v, "net channel" end
+        ok, v = pcall(res_ping)
+        if ok and type(v) == "number" and v >= 0.005 then PING.v, PING.src = v, "player resource"; return v, "player resource" end
+        PING.v, PING.src = 0.06, "default"
         return 0.06, "default"
     end
 
     -- стабильный идентификатор игрока: SteamID / bot:имя
     local PIDC = {}
+    local function pid_of(ent)
+        if ent:is_bot() then return "bot:" .. tostring(ent:get_name()) end
+        local x = tostring(ent:get_xuid() or "")
+        if x ~= "" and x ~= "0" then return "x:" .. x end
+        return "n:" .. tostring(ent:get_name())
+    end
     function W.pid(ent)
         if not ent then return nil end
         local idx = ent:get_index()
         local c = PIDC[idx]
-        if c and globals.realtime - c.t < 2 then return c.pid end
-        local ok, pid = pcall(function()
-            if ent:is_bot() then return "bot:" .. tostring(ent:get_name()) end
-            local x = tostring(ent:get_xuid() or "")
-            if x ~= "" and x ~= "0" then return "x:" .. x end
-            return "n:" .. tostring(ent:get_name())
-        end)
+        local now = globals.realtime
+        if c and now - c.t < 2 and now >= c.t then return c.pid end
+        local ok, pid = pcall(pid_of, ent)
         pid = ok and pid or nil
-        PIDC[idx] = { pid = pid, t = globals.realtime }
+        if not c then c = {}; PIDC[idx] = c end
+        c.pid, c.t = pid, now
         return pid
     end
     function W.is_bot_pid(pid) return pid ~= nil and pid:sub(1, 4) == "bot:" end
@@ -595,11 +605,25 @@ do
         return "move"
     end
 
+    local EN_REC, EN_LIST, EN_N = {}, {}, 0
+    local function add_enemy(pl)
+        if not pl:is_alive() then return end
+        local idx = pl:get_index()
+        local r = EN_REC[idx]
+        if not r then r = {}; EN_REC[idx] = r end
+        r.ent, r.idx, r.dormant, r.pid = pl, idx, pl:is_dormant(), W.pid(pl)
+        EN_N = EN_N + 1
+        EN_LIST[EN_N] = r
+    end
     function W.update(cmd)
         W.now, W.cmd = globals.curtime, cmd
         local me = entity.get_local_player()
         W.me, W.alive = me, me and me:is_alive() or false
-        if not W.alive then W.enemies, W.threat = {}, nil; return end
+        if not W.alive then
+            for i = #EN_LIST, 1, -1 do EN_LIST[i] = nil end
+            W.enemies, W.threat = EN_LIST, nil
+            return
+        end
         local wpn = me:get_player_weapon()
         W.weapon = wpn
         W.widx = wpn and wpn:get_weapon_index() or nil
@@ -613,15 +637,12 @@ do
         local okc, ch = pcall(rage.exploit.get, rage.exploit)
         W.charge = okc and ch or 0
         W.ping_s = W.ping()
-        local list = {}
-        pcall(function()
-            entity.get_players(true, true, function(pl)
-                if pl:is_alive() then
-                    list[#list + 1] = { ent = pl, idx = pl:get_index(), dormant = pl:is_dormant(), pid = W.pid(pl) }
-                end
-            end)
-        end)
-        W.enemies = list
+        -- v52: записи врагов переиспользуются по idx, список - один и тот же массив (раньше новая таблица на
+        -- врага и замыкание каждый тик). Модули читают W.enemies только в пределах тика.
+        EN_N = 0
+        pcall(entity.get_players, true, true, add_enemy)
+        for i = #EN_LIST, EN_N + 1, -1 do EN_LIST[i] = nil end
+        W.enemies = EN_LIST
     end
     RAP.on("tick", "world", function(cmd) W.update(cmd) end, 0)
 end
