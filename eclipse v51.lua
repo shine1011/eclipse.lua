@@ -1196,6 +1196,7 @@ do
         push(d)
     end
     RAP.on("level", "decisions", function() DL.open, DL.stats = {}, {} end)
+    RAP.resets.decisions = function() DL.log, DL.open, DL.stats, DL.block = {}, {}, {}, {} end
     RAP.on("save", "decisions", function()
         local out = {}
         for _, d in ipairs(DL.log) do
@@ -1363,6 +1364,7 @@ do
     end)
     RAP.on("round", "duels", function() for idx in pairs(DU.live) do close(idx, "apart") end end)
     RAP.on("save", "duels", function() RAP.store.set(KEY, { list = DU.deaths }) end)
+    RAP.resets.deaths = function() DU.deaths = {} end
 
     local function median(t) if #t == 0 then return nil end; table.sort(t); return t[math.floor(#t / 2) + 1] end
     function DU.report()
@@ -2177,7 +2179,9 @@ do
     RAP.on("ind_rows", "pressure", function(add)
         if SP.level > 0 then add(SP.level == 2 and "PRESSURE: RELEASED" or "PRESSURE: RELAX", color(255, 200, 120), 2) end
     end)
-    RAP.on("shutdown", "pressure", function() if DS and DS_OWN then DS.set_override(nil) end end)
+    function SP.release_ds() if DS and DS_OWN then DS.set_override(nil); DS_OWN = false end end
+    function SP.ds_owned() return DS_OWN end
+    RAP.on("shutdown", "pressure", function() SP.release_ds() end)
 end
 ---------------------------------------------------------------- AA: пункты чита и владение переопределениями
 -- RAP.aaset(key, value): value = nil снимает наше переопределение. Все снимается при выключении / выгрузке.
@@ -4128,7 +4132,7 @@ do
             HM.t, HM.head = globals.realtime, e.hitgroup == 1
             local s = RAP.v("fx.sound")
             if s and s ~= "Off" then
-                local p = tostring((s == "Custom" and RAP.v("fx.snd_path")) or SOUNDS[s] or ""):gsub("[;\"]", "")
+                local p = tostring((s == "Custom" and RAP.v("fx.snd_path")) or SOUNDS[s] or ""):gsub("[;\"%c]", "")
                 if p ~= "" then utils.console_exec("play " .. p) end
             end
         end)
@@ -4497,8 +4501,10 @@ do
     local S = { brk_until = 0, flash_until = 0, flinch_until = 0, prev_ground = true, fall = 0, last_wpn = nil, os_until = 0 }
     pcall(function()
         events.player_blind:set(function(e)
-            local me = entity.get_local_player()
-            if me and entity.get(e.userid, true) == me then S.flash_until = globals.curtime + U.max(0, (e.blind_duration or 1) - 0.5) end
+            U.safe("flash", function()
+                local me = entity.get_local_player()
+                if me and entity.get(e.userid, true) == me then S.flash_until = globals.curtime + U.max(0, (e.blind_duration or 1) - 0.5) end
+            end)
         end)
     end)
     RAP.on("enemy_shot", "flinch", function(kind) if kind == "hit" then S.flinch_until = globals.curtime + 0.3 end end)
@@ -5191,7 +5197,7 @@ do
     local AR = { ev = nil }
     pcall(function()
         events.grenade_prediction:set(function(e)
-            AR.ev = { t = globals.realtime, type = e.type, damage = e.damage, fatal = e.fatal }
+            U.safe("grenade prediction", function() AR.ev = { t = globals.realtime, type = e.type, damage = e.damage, fatal = e.fatal } end)
         end)
     end)
     RAP.on("tick", "grenades", function(cmd)
@@ -5236,7 +5242,7 @@ do
                 if RAP.v("misc.trash") then
                     local list = {}
                     for p in tostring(RAP.v("misc.trash_list") or ""):gmatch("[^|]+") do
-                        p = p:gsub("^%s+", ""):gsub("%s+$", ""):gsub("[;\"]", "")
+                        p = p:gsub("^%s+", ""):gsub("%s+$", ""):gsub("[;\"%c]", "")
                         if p ~= "" then list[#list + 1] = p end
                     end
                     if #list > 0 then utils.console_exec("say " .. list[U.rand(1, #list)]) end
@@ -5465,7 +5471,8 @@ do
         do
             local S = RAP.store
             local bad, total = {}, 0
-            for _, key in ipairs({ "rap2_strat", "rap2_ai", "rap2_evo", "rap2_journal", "rap2_ajournal", "rap2_reports", "rap2_widgets", "rap2_cfg", "rap2_meta" }) do
+            for _, key in ipairs({ "rap2_strat", "rap2_ai", "rap2_evo", "rap2_journal", "rap2_ajournal", "rap2_reports", "rap2_widgets", "rap2_cfg", "rap2_meta",
+                "rap2_decisions", "rap2_deaths" }) do
                 local okr, raw = pcall(function() return db[key] end)
                 if okr and type(raw) == "string" then
                     total = total + #raw
@@ -5497,7 +5504,9 @@ do
         end
         if arg == "release" then
             RAP.arb.release(); RAP.aa_release(); RAP.own_release_all()
+            if RAP.pressure and RAP.pressure.release_ds then RAP.pressure.release_ds() end
             local left = 0
+            if RAP.pressure and RAP.pressure.ds_owned and RAP.pressure.ds_owned() then left = left + 1 end
             for _, v in pairs(RAP.arb.owned) do if v then left = left + 1 end end
             for _, v in pairs(RAP.aa_owned()) do if v then left = left + 1 end end
             left = left + count(RAP.own_list())
@@ -5560,14 +5569,15 @@ do
     C.save = function() RAP.run("save"); print("[eclipse] saved") end
     RAP.console = C
     -- команды: /eclipse <команда> (основное имя) или /raap <команда> (старое имя, оставлено для привычки)
-    events.console_input:set(function(text)
+    -- true = команда скрипта (ввод не уходит в консоль игры)
+    local function handle(text)
         local t = tostring(text or ""):lower()
         local pre
         for _, p in ipairs({ "/eclipse", "/raap" }) do
             local nx = t:sub(#p + 1, #p + 1)
             if t:sub(1, #p) == p and (nx == "" or nx:match("%s")) then pre = p; break end
         end
-        if not pre then return end
+        if not pre then return false end
         local c, rest = t:sub(#pre + 1):match("^%s+(%S+)%s*(.-)%s*$")
         c = c or ""
         if C[c] then U.safe("console " .. c, C[c], rest)
@@ -5577,7 +5587,11 @@ do
             table.sort(names)
             print("[eclipse] commands: /eclipse " .. table.concat(names, " | "))
         end
-        return false
+        return true
+    end
+    events.console_input:set(function(text)
+        local ok, mine = U.safe("console", handle, text)
+        if ok and mine then return false end
     end)
 end
 
@@ -5891,7 +5905,7 @@ do
     end
     -- db: версия схемы, размеры, сброс частей
     local PARTS = { strategy = "rap2_strat", ai = "rap2_ai", evo = "rap2_evo", journal = "rap2_journal", ajournal = "rap2_ajournal", reports = "rap2_reports",
-        widgets = "rap2_widgets", cfg = "rap2_cfg" }
+        widgets = "rap2_widgets", cfg = "rap2_cfg", decisions = "rap2_decisions", deaths = "rap2_deaths" }
     RAP.cmd.db = function(arg)
         local part = arg and arg:match("^reset%s+(%S+)")
         if part then
