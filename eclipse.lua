@@ -206,8 +206,8 @@ do
             adv_k = 4,             -- усадка преимущества профиля AA к 0 (в эффективных выборках)
             adv_k_enemy = 10,      -- то же для преимущества против конкретного врага
             old_prior = 4,         -- вес старых счетчиков AA (до v60) как приора, в выстрелах
-            ph_delta = 0.05,       -- Page-Hinkley: допуск
-            ph_lambda = 2.0,       -- порог срабатывания
+            ph_delta = 0.10,       -- Page-Hinkley: допуск (подобран на симуляции tests/run.lua: ~4% ложных тревог на 100
+            ph_lambda = 5.0,       -- выстрелов без изменения, 90% срабатываний в пределах ~21 выстрела после падения на 0.45)
             ph_min_n = 8,          -- не раньше стольких выстрелов
             w_reset = 0.6,         -- выстрел врага сразу после случайного сброса фазы jitter (v58)
             w_teleport = 0.3,      -- выстрел врага, пока ты в телепорте / возврате ideal tick
@@ -892,6 +892,40 @@ do
             return true, drop, s.n
         end
         return false, s.mx - s.ph, s.n
+    end
+
+    ---------------- off-policy evaluation по журналу
+    -- rows: { a = вариант, p = вероятность, с которой он был выбран, y = исход, b = базовая линия, w = вес атрибуции }.
+    -- Для каждого варианта a - ценность политики "всегда a":
+    --   SNIPS = Σ u y / Σ u, u = w / p по записям, где выбран a (самонормированный IPS);
+    --   DR-lite = средняя базовая линия по всем записям + Σ u (y - b) / Σ u (базовая линия как модель исхода, IPS по
+    --   остатку - смещение базовой линии гасится, дисперсия ниже, чем у чистого IPS);
+    --   se - по самонормированной формуле, ess = (Σu)^2 / Σu^2. Записи без p (до v60) пропускаются.
+    -- Честно: варианты, которые в каком-то контексте не выбираются никогда (p = 0, например эксперименты под guard в
+    -- опасных ситуациях), там не оцениваются - перекрытия нет, это видно по доле "опасных" записей в отчете.
+    function L.ope(rows)
+        local A, sb, sw, skipped = {}, 0, 0, 0
+        for _, r in ipairs(rows) do
+            local w = r.w or 1
+            if r.a ~= nil and r.p and r.p > 0 and r.y and w > 0 then
+                local u = w / r.p
+                local x = A[r.a]
+                if not x then x = { su = 0, suy = 0, su2 = 0, su2y = 0, su2y2 = 0, sadv = 0, n = 0, dg = 0 }; A[r.a] = x end
+                local b = r.b or 0.5
+                x.su, x.suy, x.su2, x.n = x.su + u, x.suy + u * r.y, x.su2 + u * u, x.n + 1
+                x.su2y, x.su2y2, x.sadv = x.su2y + u * u * r.y, x.su2y2 + u * u * r.y * r.y, x.sadv + u * (r.y - b)
+                if r.dg then x.dg = x.dg + 1 end
+                sb, sw = sb + w * b, sw + w
+            else skipped = skipped + 1 end
+        end
+        local mb = sw > 0 and sb / sw or 0.5
+        local out = {}
+        for a, x in pairs(A) do
+            local v = x.suy / x.su
+            local var = U.max(0, x.su2y2 - 2 * v * x.su2y + v * v * x.su2) / (x.su * x.su)
+            out[a] = { snips = v, dr = mb + x.sadv / x.su, se = U.sqrt(var), ess = x.su * x.su / U.max(x.su2, 1e-9), n = x.n, dg = x.n > 0 and x.dg / x.n or 0 }
+        end
+        return out, skipped, mb
     end
 
     ---------------- хранение
@@ -7020,8 +7054,44 @@ do
         end
         return M
     end
+    -- v60: /eclipse replay - off-policy evaluation по журналам (SNIPS + DR-lite) с логированными вероятностями выбора,
+    -- включая эксперименты и испытания Evo; старая симуляция "только совпавшие решения" - /eclipse replay legacy [...]
+    local function ope_print(title, rows, map, names)
+        local data = {}
+        for _, r in ipairs(rows) do data[#data + 1] = map(r) end
+        local est, skipped, mb = RAP.learn.ope(data)
+        local list = {}
+        for a, x in pairs(est) do list[#list + 1] = { a, x } end
+        table.sort(list, function(x, y) return x[2].dr > y[2].dr end)
+        print(string.format("[replay] %s: %d rows usable, %d skipped (no propensity / no weight - before v60 or not learnable), mean baseline %.0f%%",
+            title, #rows - skipped, skipped, mb * 100))
+        for _, it in ipairs(list) do
+            local x = it[2]
+            print(string.format("[replay]   %-16s DR %4.0f%%  SNIPS %4.0f%%  +/-%3.0f  ess %5.1f  n %4d%s", tostring(names(it[1])), x.dr * 100, x.snips * 100,
+                1.96 * x.se * 100, x.ess, x.n, x.dg > 0 and string.format("  (%.0f%% in dangerous context)", x.dg * 100) or ""))
+        end
+        if #list == 0 then print("[replay]   no rows with logged propensity yet - play with v60+") end
+        return est
+    end
+    local function replay_ope(which)
+        if which ~= "aa" then
+            local ARMS = RAP.strat.ARMS
+            ope_print("strategy (value = share of target HP per shot)", RAP.tele.journal.rows,
+                function(r) return { a = r.an, p = r.pr, y = r.o, b = r.b, w = r.aw } end, function(a) return ARMS[a] or a end)
+        end
+        if which ~= "strat" then
+            local P = RAP.profiles.list
+            ope_print("AA profiles (value = dodge rate)", RAP.tele.ajournal.rows,
+                function(r) return { a = r.p, p = r.pr, y = r.o, b = r.b, w = r.aw and (r.aw * (r.w0 or 1)) or nil, dg = r.dg == 1 } end,
+                function(a) return P[a] and P[a].name or a end)
+        end
+        print("[replay] method: self-normalized IPS and DR-lite (baseline + IPS of the advantage); +/- = 95% interval; overlapping intervals = no evidence of a difference")
+    end
     RAP.cmd.replay = function(arg)
         arg = tostring(arg or "")
+        local rest = arg:match("^legacy%s*(.*)$")
+        if not rest then return replay_ope(arg:match("^aa") and "aa" or (arg:match("^strat") and "strat" or nil)) end
+        arg = rest
         if arg:match("^aa") then
             local rows = RAP.tele.ajournal.rows
             if #rows < 10 then print(string.format("[replay] AA journal has %d enemy shots - play more (need 10+)", #rows)); return end

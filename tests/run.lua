@@ -564,6 +564,121 @@ test("learn: one sample per shot_id (no double counting), effective-only learnin
     assert(ST.ctx["x:3|Auto|jitter"].arms[4].vm == vm0, "non-effective shot must not teach the arm")
 end)
 
+---------------------------------------------------------------- симулятор с известной истиной
+local RNG = { s = 12345 }
+local function rnd() RNG.s = (RNG.s * 1103515245 + 12345) % 2147483648; return RNG.s / 2147483648 end
+local function bern(p) return rnd() < p and 1 or 0 end
+
+test("sim: under the v58 guard raw dodge rates rank AA profiles wrongly, advantage ranks them right", function()
+    local E = S.load(PATH)
+    local AI = E.RAP.ai
+    RNG.s = 777
+    local smp, ai = E.hook("enemy_shot", "learn sample aa"), E.hook("enemy_shot", "ai")
+    -- истина: профиль 9 лучше профиля 10 на +0.10 в ЛЮБОМ контексте; опасный контекст сам по себе тяжелее
+    local base = { [true] = 0.30, [false] = 0.75 }
+    local eff = { [9] = 0.10, [10] = 0.0 }
+    local raw = { [9] = { 0, 0 }, [10] = { 0, 0 } }
+    for k = 1, 1600 do
+        local danger = rnd() < 0.5
+        -- guard: в опасном контексте всегда "лучший" (9); эксперимент (10) - только в безопасном
+        local prof = danger and 9 or (rnd() < 0.6 and 10 or 9)
+        local y = bern(base[danger] + eff[prof])
+        raw[prof][1], raw[prof][2] = raw[prof][1] + y, raw[prof][2] + 1
+        local rec = { sid = 50000 + k, grp = 50000 + k, pid = "x:" .. (k % 7), w = 1, dist = 20, sdist = 1000, hitgroup = 3,
+            ctx = { group = "stand", profile = prof, applied = true, mixed = false, wc = "rifle", al = { danger = danger, spd = 0 } } }
+        local kind = y == 1 and "dodge" or "hit"
+        smp(kind, rec); ai(kind, rec)
+    end
+    local r9, r10 = raw[9][1] / raw[9][2], raw[10][1] / raw[10][2]
+    assert(r10 > r9, string.format("simulation setup: raw rates should be confounded (9: %.2f, 10: %.2f)", r9, r10))
+    local m9, m10 = AI.post("stand", 9), AI.post("stand", 10)
+    -- истинная разница 0.10; оценка меньше: в опасном контексте стоит только 9 (нет перекрытия), и там его эффект
+    -- неотделим от контекста - это честный предел, а не ошибка. Важно направление и заметный отрыв.
+    assert(m9 > m10 + 0.02, string.format("advantage must rank 9 above 10: %.3f vs %.3f (raw %.2f vs %.2f)", m9, m10, r9, r10))
+end)
+
+test("sim: strategy learning recovers the arm with the best HP-share value", function()
+    local E = S.load(PATH)
+    local ST = E.RAP.strat
+    RNG.s = 4242
+    local key = "x:50|Auto|jitter"
+    local truth = { [1] = 0.40, [2] = 0.58, [4] = 0.36, [6] = 0.42, [8] = 0.50 }
+    local arms = { 1, 2, 4, 6, 8 }
+    for k = 1, 900 do
+        local arm = arms[math.floor(rnd() * #arms) + 1]
+        local kill = bern(truth[arm])                     -- упрощение: выстрел либо убивает, либо промах
+        our_ack(E, { idx = 9, pid = "x:50", hp0 = 100, sid = 60000 + k, grp = 60000 + k,
+            ctx = { arm = arm, key = key, wg = "Auto", aatk = "jitter", attr = 1, p = 0.2 } },
+            kill == 1 and { state = nil, damage = 100, hitgroup = 1 } or { state = "correction" })
+    end
+    local best, bm = nil, -1
+    for _, a in ipairs(arms) do local m = ST.post(key, a, "Auto", "jitter"); if m > bm then best, bm = a, m end end
+    assert(best == 2, "best arm " .. tostring(best))
+end)
+
+test("sim: SNIPS / DR-lite estimates are unbiased under a context-dependent logging policy", function()
+    local E = S.load(PATH)
+    local L = E.RAP.learn
+    local truth = { a = { [1] = 0.70, [2] = 0.30 }, b = { [1] = 0.55, [2] = 0.45 }, c = { [1] = 0.40, [2] = 0.20 } }
+    local pol = { [1] = { a = 0.6, b = 0.3, c = 0.1 }, [2] = { a = 0.1, b = 0.3, c = 0.6 } }   -- p зависит от контекста
+    local err = { snips = 0, dr = 0 }
+    for seed = 1, 6 do
+        RNG.s = seed * 99991
+        local rows = {}
+        for _ = 1, 4000 do
+            local ctx = rnd() < 0.5 and 1 or 2
+            local u, acc, a = rnd(), 0, "c"
+            for _, x in ipairs({ "a", "b", "c" }) do acc = acc + pol[ctx][x]; if u < acc then a = x; break end end
+            rows[#rows + 1] = { a = a, p = pol[ctx][a], y = bern(truth[a][ctx]), b = ctx == 1 and 0.6 or 0.3, w = 1 }
+        end
+        local est = L.ope(rows)
+        for a, t in pairs(truth) do
+            local v = (t[1] + t[2]) / 2
+            err.snips = math.max(err.snips, math.abs(est[a].snips - v))
+            err.dr = math.max(err.dr, math.abs(est[a].dr - v))
+        end
+    end
+    assert(err.snips < 0.05 and err.dr < 0.05, string.format("max error SNIPS %.3f DR %.3f", err.snips, err.dr))
+end)
+
+test("sim: calibration slope ~1 for honest predictions, < 1 for over-confident ones (shrinks confidence)", function()
+    local E = S.load(PATH)
+    local L = E.RAP.learn
+    RNG.s = 31337
+    for _ = 1, 3000 do
+        local p = 0.2 + 0.6 * rnd()
+        local y = bern(p)
+        L.calib_add("honest", p, y, 1)
+        L.calib_add("over", math.max(0, math.min(1, 0.5 + 2 * (p - 0.5))), y, 1)
+    end
+    local s1, s2 = L.calib_slope("honest"), L.calib_slope("over")
+    assert(s1 > 0.85 and s1 < 1.15, "honest slope " .. s1)
+    assert(s2 < 0.65, "over-confident slope " .. s2)
+    assert(L.shrink("over") < 0.7 and L.shrink("honest") > 0.85)
+end)
+
+test("sim: change detection fires within 30 shots after a behaviour change and rarely before", function()
+    local E = S.load(PATH)
+    local L = E.RAP.learn
+    local false_alarms, delays = 0, {}
+    for seed = 1, 40 do
+        RNG.s = seed * 7919
+        local key = "s" .. seed
+        local fired_at
+        for k = 1, 160 do
+            local p = k <= 100 and 0.6 or 0.15
+            local f = L.ph_add(key, bern(p) - 0.6)
+            if f then
+                if k <= 100 then false_alarms = false_alarms + 1 elseif not fired_at then fired_at = k - 100 end
+            end
+        end
+        delays[#delays + 1] = fired_at or 999
+    end
+    table.sort(delays)
+    assert(false_alarms <= 5, "false alarms before the change: " .. false_alarms .. " of 40 runs")
+    assert(delays[math.floor(#delays * 0.9)] <= 30, "90% detection delay " .. delays[math.floor(#delays * 0.9)])
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP
