@@ -769,7 +769,7 @@ do
     local U = RAP.U
     local KEY = "rap2_learn"
     local L = { did = 0, sid = 0, dec = {}, dec_n = 0, seen = {}, seen_q = {}, seen_i = 0, base = { aa = {}, st = {} },
-        calib = {}, ph = {}, stats = { samples = 0, dup = 0 } }
+        calib = {}, ph = {}, stats = { samples = 0, dup = 0, our = 0, orphan = 0, enemy = {} } }
     RAP.learn = L
     local function C() return RAP.CFG.learn end
 
@@ -1015,6 +1015,13 @@ do
             end
         end
         print(string.format("[calib] samples %d (duplicates rejected %d) | decisions logged %d | last shot id %d", L.stats.samples, L.stats.dup, L.did, L.sid))
+        -- откуда выборки в этой сессии: выстрелы врагов учат AA только при dodge / hit (far / blocked / inaccurate / bot -
+        -- не про твой AA); твои выстрелы без aim_fire (orphan) не учат стратегию
+        local ek = {}
+        for k, n in pairs(L.stats.enemy) do ek[#ek + 1] = k .. " " .. n end
+        table.sort(ek)
+        print(string.format("[calib] this session: your shots acked %d (orphan %d) | enemy shots %s (AA learns from dodge / hit only)",
+            L.stats.our, L.stats.orphan, #ek > 0 and table.concat(ek, ", ") or "none"))
     end
 end
 ---------------------------------------------------------------- shots: выстрелы врагов по тебе и твои выстрелы
@@ -1651,7 +1658,9 @@ do
             for k = n2 - 1, 0, -1 do
                 local d2 = L.dec[(L.dec_n - k - 1) % 300 + 1]
                 if d2 and d2.id then
-                    print(string.format("[decisions] #%-5d %-5s %-22s chose %-3s of %d  p %.2f  %-26s%s", d2.id, d2.sys, tostring(d2.key):sub(1, 22), tostring(d2.ch),
+                    local ch = tostring(d2.ch)
+                    if d2.sys == "strat" and RAP.strat and RAP.strat.ARMS[d2.ch] then ch = RAP.strat.ARMS[d2.ch] end
+                    print(string.format("[decisions] #%-5d %-5s %-22s chose %-12s of %d  p %.2f  %-26s%s", d2.id, d2.sys, tostring(d2.key):sub(1, 22), ch:sub(1, 12),
                         d2.n, d2.p, tostring(d2.why):sub(1, 26), d2.verify and "  [verified]" or ""))
                 end
             end
@@ -2402,6 +2411,8 @@ do
     local function dband(d) if not d then return "?" end; return d < 600 and "near" or (d < 1500 and "mid" or "far") end
     RAP.on("our_ack", "learn sample", function(rec, e)
         local L = RAP.learn
+        L.stats.our = L.stats.our + 1
+        if rec.orphan then L.stats.orphan = L.stats.orphan + 1 end
         if rec.orphan or not L.sample(rec.sid) then return end
         local ok = e.state == nil
         local y = 0
@@ -4145,6 +4156,7 @@ do
     local LEARN_KIND = { dodge = true, hit = true }
     RAP.on("enemy_shot", "learn sample aa", function(kind, rec)
         local L, cfg = RAP.learn, RAP.CFG.learn
+        L.stats.enemy[kind] = (L.stats.enemy[kind] or 0) + 1
         if not LEARN_KIND[kind] or not L.sample(rec.sid) then return end
         local ctx = rec.ctx
         local al = ctx.al or {}

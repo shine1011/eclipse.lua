@@ -791,6 +791,7 @@ test("learn: console commands calib / replay / decisions log / attr run on mixed
     RAP.tele.journal.rows = rows
     E.console("/eclipse attr")
     assert(has_line(E, "60 shots with logged decisions") and has_line(E, "correction"), "attr output")
+    assert(has_line(E, "this session: your shots acked"), "calib channel counts")
     no_errors(E)
 end)
 
