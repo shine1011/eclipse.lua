@@ -963,7 +963,7 @@ do
 
     -- серия: выстрел того же стрелка < 0.35 с после предыдущего (DT) - одно решение, а не две независимые выборки.
     -- Первый выстрел серии учит полностью, следующие - с весом CFG.attr.burst и не считаются в panic / phase shift / brute.
-    SH.elast, SH.olast = {}, {}
+    SH.elast, SH.olast, SH.egrp, SH.ogrp = {}, {}, {}, {}
     local function mark_burst(rec, last, key)
         local lt = last[key]
         rec.burst = (lt ~= nil and rec.t >= lt and rec.t - lt < 0.35) or false
@@ -981,6 +981,9 @@ do
             state = RAP.W.state, ctx = {}, sdist = start:dist(eye) }
         pcall(function() rec.sdorm = sh:is_dormant() end)
         mark_burst(rec, SH.elast, idx)
+        rec.sid = RAP.learn.next_shot()
+        rec.grp = (rec.burst and SH.egrp[idx]) or rec.sid       -- серия DT одного стрелка - одна группа независимости
+        SH.egrp[idx] = rec.grp
         RAP.run("enemy_shot_start", rec)     -- AA-движок (этап 2) кладет сюда профиль и сторону на момент выстрела
         local h = SH.hurt[idx]
         -- попадание уже отправлено подписчикам как untracked-hit: запись помечается, но второй раз не оценивается
@@ -1061,8 +1064,11 @@ do
             SH.last_hurt = SH.last_hurt or {}
             SH.last_hurt[idx] = now
             -- попадание без записи: оценивается сразу (запись может прийти позже и будет помечена попаданием)
-            local rec = { t = now, enemy = idx, pid = RAP.W.pid(att), hit = true, hitgroup = e.hitgroup, state = RAP.W.state, ctx = {} }
+            local rec = { t = now, enemy = idx, pid = RAP.W.pid(att), hit = true, hitgroup = e.hitgroup, state = RAP.W.state, ctx = {}, mq = "H" }
             mark_burst(rec, SH.elast, idx)
+            rec.sid = RAP.learn.next_shot()
+            rec.grp = (rec.burst and SH.egrp[idx]) or rec.sid
+            SH.egrp[idx] = rec.grp
             RAP.run("enemy_shot_start", rec)
             rec.untracked = true
             st("hit")
@@ -1108,6 +1114,8 @@ do
                 table.remove(SH.pending, i)
                 if not p.fired then SH.done[p.enemy] = p.t end
                 local kind = judge(p)
+                -- качество сопоставления: F - bullet_fire, I - impact, H - player_hurt (какие события собрали выстрел)
+                p.mq = (p.fired and "F" or "") .. (p.imp and "I" or "") .. (p.hit and "H" or "")
                 if kind then
                     st(kind)
                     if kind == "hit" and not RAP.W.learn(p.pid) then kind = "bot" end
@@ -1118,7 +1126,7 @@ do
     end, 5)
     -- новая карта: записи со старым curtime никогда не оценились бы и перехватывали бы новые bullet_fire
     RAP.on("level", "shots", function()
-        SH.pending, SH.done, SH.hurt, SH.elast, SH.olast, SH.ours = {}, {}, {}, {}, {}, {}
+        SH.pending, SH.done, SH.hurt, SH.elast, SH.olast, SH.ours, SH.egrp, SH.ogrp = {}, {}, {}, {}, {}, {}, {}, {}
         SH.last_hurt = nil
     end)
 
@@ -1129,6 +1137,12 @@ do
             local rec = { id = e.id, t = globals.curtime, target = e.target, idx = e.target and e.target:get_index(),
                 pid = e.target and RAP.W.pid(e.target), wgroup = RAP.W.wgroup, mst = RAP.W.state, ctx = {} }
             mark_burst(rec, SH.olast, rec.idx or -1)
+            rec.sid = RAP.learn.next_shot()
+            -- группа независимости: серия DT по цели; все пули одного цикла ideal tick - тоже одна группа
+            local itc = RAP.it and RAP.it.st == "SHOT" and RAP.it.cyc and RAP.it.cyc.shot_tick
+            rec.itc = itc
+            rec.grp = (itc and ("it" .. itc)) or ((rec.burst and SH.ogrp[rec.idx or -1]) or rec.sid)
+            SH.ogrp[rec.idx or -1] = rec.grp
             SH.ours[e.id] = rec
             SH.last_fire = globals.curtime
             RAP.run("our_fire", rec, e)
@@ -1136,7 +1150,12 @@ do
     end)
     events.aim_ack:set(function(e)
         U.safe("aim_ack", function()
-            local rec = SH.ours[e.id] or { id = e.id, idx = e.target and e.target:get_index(), pid = e.target and RAP.W.pid(e.target), ctx = {} }
+            local rec = SH.ours[e.id]
+            if not rec then
+                -- aim_ack без aim_fire (поздний / потерянный): своя запись, свой shot_id, без решения (не учит стратегию)
+                rec = { id = e.id, idx = e.target and e.target:get_index(), pid = e.target and RAP.W.pid(e.target), ctx = {}, orphan = true }
+                rec.sid = RAP.learn.next_shot(); rec.grp = rec.sid
+            end
             SH.ours[e.id] = nil
             rec.state = e.state
             RAP.run("our_ack", rec, e)
@@ -1186,6 +1205,14 @@ do
             hc = e.hitchance, d = e.damage, wd = e.wanted_damage, hg = e.hitgroup, wh = e.wanted_hitgroup,
             r = ok and "hit" or tostring(e.state), k = before, ch = rec.ctx.changed and 1 or 0, bt = e.backtrack, rt = rec.ctx.rt,
             aw = rec.ctx.attr and U.round(rec.ctx.attr * 100) / 100 or nil, ms = rec.mst, ef = rec.ctx.eff == false and 0 or nil }
+        -- v60: поля выборки (для OPE / калибровки / сравнения версий): shot_id, решение, вероятность выбора, исход (доля
+        -- HP), базовая линия, преимущество, группа независимости, предсказание; rv = 2 - награда "доля HP" (с v58)
+        local smp = rec.sample
+        if smp then
+            local function r2(x) return x and U.round(x * 100) / 100 or nil end
+            row.sid, row.did, row.pr, row.o, row.b, row.av, row.gp, row.pd, row.an, row.rv = smp.sid, smp.did, r2(smp.p), r2(smp.y), r2(smp.b),
+                r2(smp.adv), smp.grp, r2(smp.pred), smp.arm, 2
+        end
         local rows = T.journal.rows
         rows[#rows + 1] = row
         local keep = RAP.CFG.log.keep
@@ -2179,6 +2206,14 @@ do
             -- голос политики головы ("head: ...") совпадает по смыслу с головными стратегиями 2 / 8 - выстрел про них
             local head_ok = (arm == 2 or arm == 8) and src and src:sub(1, 5) == "head:"
             if not head_ok and (not src or src:sub(1, 9) ~= "strategy:") then return false, k .. " <- " .. tostring(w and w.src or "-") end
+            -- v60: голос стратегии совпал с твоим значением в меню -> стратегия ничего не изменила (Default целился бы так
+            -- же) и не получает ни заслуги, ни вины. Твое значение видно, только если get() ~= get_override().
+            local it = RAP.ref.rage[k].cur()
+            local okg, mine = pcall(it.get, it)
+            local oko, ov = pcall(it.get_override, it)
+            if okg and oko and ov ~= nil and not RAP.U.same(mine, ov) and RAP.U.same(mine, w.value) then
+                return false, k .. " = your own setting (no effect vs Default)"
+            end
             ::skip::
         end
         return true
@@ -2194,6 +2229,9 @@ do
         end
         if not t then return end
         local applied = ST.applied or t.arm
+        -- v60: решение, которое реально стояло (стратегия цели-угрозы - настройки рагебота общие для всех целей)
+        local at = ST.applied_t or t
+        rec.ctx.p, rec.ctx.did = at.prop or 1, at.did
         rec.ctx.mode, rec.ctx.arm, rec.ctx.key, rec.ctx.wg, rec.ctx.aatk = ARMS[applied], applied, t.key, t.wg, t.aat
         rec.ctx.changed, rec.ctx.why = t.switched == true, t.why
         rec.ctx.conf = select(1, ST.post(t.key, applied, t.wg, t.aat))
@@ -2236,6 +2274,47 @@ do
         RAP.CONF = RAP.CONF or {}
         RAP.CONF.shot = { w = w, why = why, r = e.state or "hit", t = globals.realtime }
     end, 10)
+    -- v60: ВЫБОРКА нашего выстрела - ровно одна на shot_id, единственный вход для обучения Strategy AI.
+    --   y - доля HP цели, снятая выстрелом (убийство = 1, промах = 0); w - вес атрибуции (0, если стратегия не
+    --   действовала / причина промаха не про выбор хитбокса); b - базовая линия E[y | оружие x цель стоит / движется x
+    --   тип AA x дистанция] по всем выстрелам; adv = y - b; p / did - вероятность выбора и решение; pred - оценка
+    --   стратегии на момент выстрела (для калибровки); grp - группа независимости (серия DT / цикл ideal tick).
+    local function dband(d) if not d then return "?" end; return d < 600 and "near" or (d < 1500 and "mid" or "far") end
+    RAP.on("our_ack", "learn sample", function(rec, e)
+        local L = RAP.learn
+        if rec.orphan or not L.sample(rec.sid) then return end
+        local ok = e.state == nil
+        local y = 0
+        if ok then y = U.clamp((e.damage or 0) / U.max(1, rec.hp0 or 100), 0, 1) end
+        local tc = rec.idx and RAP.TC[rec.idx]
+        local tmove = tc and ((tc.move.speed or 0) < 5 and "st" or "mv") or "?"
+        local wg = rec.ctx.wg or rec.wgroup or "?"
+        local fine = wg .. "|" .. tmove .. "|" .. tostring(rec.ctx.aatk or rec.ctx.aat or "?") .. "|" .. dband(tc and tc.geo.dist)
+        local coarse = wg .. "|" .. tmove
+        local b = L.base_get("st", fine, coarse)
+        L.base_add("st", fine, coarse, y, 1)
+        local w = rec.ctx.attr or 0
+        if rec.ctx.arm == nil then w = 0 end
+        local smp = { sid = rec.sid, did = rec.ctx.did, arm = rec.ctx.arm, key = rec.ctx.key, y = y, b = b, adv = y - b, w = w,
+            p = rec.ctx.p or 1, pred = rec.ctx.conf, grp = rec.grp, why = rec.ctx.attr_why }
+        rec.sample = smp
+        rec.ctx.val = y
+        if w > 0 and smp.pred then L.calib_add("st", smp.pred, y, w) end
+        L.mark()
+        -- обнаружение изменения поведения врага: преимущество наших выстрелов по нему резко упало -> RELEARNING
+        if w >= 0.5 and rec.pid then
+            local fired, drop, n = L.ph_add("st|" .. rec.pid, smp.adv)
+            if fired then
+                local t = rec.idx and ST.T[rec.idx]
+                if t and t.pid == rec.pid then
+                    t.state, t.relearn, t.why = "RELEARNING", C().relearn_shots, string.format("change-point: advantage dropped (PH %.2f after %d shots)", drop, n)
+                    decided(t, 1, "change-point", false)
+                end
+                RAP.dl.note("cp", rec.pid, "strategy", "relearn", string.format("Page-Hinkley drop %.2f over %d shots", drop, n), "detected")
+                if RAP.v("st.logs") then U.log("strategy", "%s: behaviour change detected (PH %.2f, %d shots) -> relearning", rec.pid, drop, n) end
+            end
+        end
+    end, 11)
     RAP.on("our_ack", "strategy", function(rec, e)
         local ok = e.state == nil
         RAP.store.mark(KEY)
@@ -2246,8 +2325,10 @@ do
         end
         local arm, key = rec.ctx.arm, rec.ctx.key
         if not arm or not key or not RAP.v("st.on") then return end
-        local cw = rec.ctx.attr
-        if cw == nil then cw = (ok or LEARN[e.state]) and 1 or 0 end
+        -- v60: обучение - только из выборки (rec.sample): вес, исход и группа уже посчитаны, второй раз не считается
+        local smp = rec.sample
+        if not smp then return end
+        local cw = smp.w
         if cw <= 0 then return end
         local c = C()
         local en = ctx_entry(key)
@@ -2256,12 +2337,7 @@ do
         local x = en.arms[arm]
         -- v58: награда = доля HP цели, снятая выстрелом: min(урон, HP до выстрела) / HP до выстрела; убийство = 1,
         -- промах = 0. Голова в HvH чаще убивает одним выстрелом - модель видит это напрямую, а не через вес 1.5.
-        local val = 0
-        if ok then
-            local hp0 = rec.hp0 or 100
-            val = U.clamp((e.damage or 0) / U.max(1, hp0), 0, 1)
-        end
-        rec.ctx.val = val
+        local val = smp.y
         x.vh, x.vm, x.vw2 = x.vh + cw * val, x.vm + cw * (1 - val), x.vw2 + cw * cw
         x.att = x.att + 1
         -- ценность попадания: голова весит больше, "царапина" (урон < половины желаемого) меньше - стратегия
@@ -3438,7 +3514,9 @@ do
     local KEY, OLD = "rap2_ai", "rage_aa_pro_ai_v11"
     -- since[g]: когда в группе включен текущий профиль; bdw["группа|оружие врага"]: увороты / попадания по классу оружия стрелка
     -- ets[pid]: когда враг последний раз учил per-enemy статистику (unixtime) - при сохранении остаются самые свежие
-    local AI = { st = {}, en = {}, sm = {}, cur = {}, last_switch = {}, since = {}, hits = {}, bd = {}, ebd = {}, bdw = {}, gs = {}, ets = {} }
+    -- adv[g][i] / eadv[pid][g][i] (v60): преимущество профиля (исход - базовая линия контекста) - аккумуляторы RAP.learn
+    local AI = { st = {}, en = {}, sm = {}, cur = {}, last_switch = {}, since = {}, hits = {}, bd = {}, ebd = {}, bdw = {}, gs = {}, ets = {},
+        adv = {}, eadv = {} }
     RAP.ai = AI
     local GROUPS = RAP.aa.GROUPS
 
@@ -3509,6 +3587,25 @@ do
                     local e = {}
                     for g, row in pairs(groups) do if type(g) == "string" and type(row) == "table" then e[g] = load_row(row) end end
                     AI.ebd[pid] = e
+                end
+            end
+        end
+        if d and type(d.adv) == "table" then
+            for g, row in pairs(d.adv) do
+                if type(g) == "string" and type(row) == "table" then
+                    AI.adv[g] = {}
+                    for k, a in pairs(row) do local i = tonumber(k); if i and P[i] then AI.adv[g][i] = RAP.learn.acc_load(a) end end
+                end
+            end
+        end
+        if d and type(d.eadv) == "table" then
+            for pid, groups in pairs(d.eadv) do
+                if type(pid) == "string" and type(groups) == "table" then
+                    local e = {}
+                    for g, row in pairs(groups) do
+                        if type(row) == "table" then e[g] = {}; for k, a in pairs(row) do local i = tonumber(k); if i and P[i] then e[g][i] = RAP.learn.acc_load(a) end end end
+                    end
+                    AI.eadv[pid] = e
                 end
             end
         end
@@ -3596,8 +3693,28 @@ do
         local al, be = 1 + b * 3 + d, 1 + (1 - b) * 3 + h
         -- среднее - со смешанными весами (враг / оружие важнее), неопределенность и n - по уникальным событиям:
         -- раньше 5 выстрелов одного врага считались как 15-20 и уверенность росла в 3-4 раза быстрее, чем есть данных
-        local m = al / (al + be)
-        return m, m * (1 - m) / (5 + n_u + 1), n_u
+        local m0 = al / (al + be)
+        local v0 = m0 * (1 - m0) / (5 + n_u + 1)
+        -- v60: оценка по ПРЕИМУЩЕСТВУ (исход - базовая линия контекста), а не по сырой доле уворотов. С v58 guard
+        -- ставит эксперименты только в легких контекстах - сырые доли несравнимы между профилями (смещение отбора).
+        -- m = общая базовая линия + усаженное преимущество профиля (+ поправка против врага); старая модель по
+        -- счетчикам - приор весом CFG.learn.old_prior. n - СОБСТВЕННЫЙ эффективный объем (Kish ESS) преимущества.
+        local L, cfg = RAP.learn, RAP.CFG.learn
+        local acc = AI.adv[g] and AI.adv[g][i]
+        local ess = acc and L.acc_ess(acc) or 0
+        if ess <= 0 then return m0, v0, 0 end
+        local gb = L.base_get("aa")
+        local A = L.acc_mean(acc) * ess / (ess + cfg.adv_k)
+        local vA = L.acc_var(acc, 0.1) * ess / (ess + cfg.adv_k)
+        if pid and RAP.v("ai.per_enemy") then
+            local ea = AI.eadv[pid] and AI.eadv[pid][g] and AI.eadv[pid][g][i]
+            local ee = ea and L.acc_ess(ea) or 0
+            if ee > 0 then A = A + (L.acc_mean(ea) - L.acc_mean(acc)) * ee / (ee + cfg.adv_k_enemy) end
+        end
+        local k0 = n_u > 0 and cfg.old_prior or 0
+        local m = (m0 * k0 + (gb + A) * ess) / (k0 + ess)
+        local f0, f1 = k0 / (k0 + ess), ess / (k0 + ess)
+        return U.clamp(m, 0.01, 0.99), v0 * f0 * f0 + vA * f1 * f1 + 1e-4, ess
     end
     local function phi(z)
         local s2, x = z < 0 and -1 or 1, U.abs(z) / 1.41421356
@@ -3605,10 +3722,11 @@ do
         local y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * math.exp(-x * x)
         return 0.5 * (1 + s2 * y)
     end
+    -- v60: единая уверенность (RAP.learn.p_better) с поправкой калибровки AA
     function AI.p_better(g, b, a, pid)
         local mb, vb = AI.post(g, b, pid)
         local ma, va = AI.post(g, a, pid)
-        return phi((mb - ma) / U.sqrt(U.max(vb + va, 1e-6)))
+        return RAP.learn.p_better(mb, vb, ma, va, "aa")
     end
     -- optimistic = true: оценка + 1 sd (непроверенные профили получают шанс, когда текущий подвел)
     function AI.best(g, exclude, pid, optimistic)
@@ -3827,21 +3945,94 @@ do
         if rec.ctx.fs then w = w * 0.5; why[#why + 1] = "freestanding active" end
         return w, #why > 0 and table.concat(why, ", ") or (kind == "hit" and "head hit" or "clean dodge")
     end
+    -- v60: ВЫБОРКА выстрела врага по тебе - ровно одна на shot_id, единственный вход для AA AI / phase / evo.
+    --   y - 1 уворот / 0 попадание; w - вес атрибуции (AI.attr + сброс фазы / телепорт ideal tick / defensive) x
+    --   информативность (разброс оружия, нет bullet_fire) - БЕЗ веса 1.5 за голову (он смещал оценку доли уворотов);
+    --   b - базовая линия E[y | оружие врага x дистанция x ты движешься x враг движется x вердикт guard] по ВСЕМ
+    --   выстрелам (контекст, а не профиль); adv = y - b; p - эффективная вероятность того, что в этом контексте стоял
+    --   этот профиль (в опасном контексте guard ставит лучший детерминированно: p = 1); pred - оценка профиля.
+    local function dband(d) if not d then return "?" end; return d < 600 and "near" or (d < 1500 and "mid" or "far") end
+    local LEARN_KIND = { dodge = true, hit = true }
+    RAP.on("enemy_shot", "learn sample aa", function(kind, rec)
+        local L, cfg = RAP.learn, RAP.CFG.learn
+        if not LEARN_KIND[kind] or not L.sample(rec.sid) then return end
+        local ctx = rec.ctx
+        local al = ctx.al or {}
+        local g, i = ctx.group, ctx.profile
+        local y = kind == "dodge" and 1 or 0
+        local tcx = rec.enemy and RAP.TC[rec.enemy]
+        local emove = tcx and ((tcx.move.speed or 0) > 5 and "mv" or "st") or "?"
+        local wc = ctx.wc or "?"
+        local db = dband(rec.sdist)
+        local fine = wc .. "|" .. db .. "|" .. (((al.spd or 0) > 40) and "mv" or "st") .. "|" .. emove .. "|" .. (al.danger and "d" or "s")
+        local coarse = wc .. "|" .. db
+        local b = L.base_get("aa", fine, coarse)
+        L.base_add("aa", fine, coarse, y, 1)
+        local aw, awhy = 0, "no profile"
+        if g and i and RAP.v("aa.source") ~= "Builder" then aw, awhy = AI.attr(kind, rec) end
+        local why = { awhy }
+        if aw > 0 then
+            if al.reset then aw = aw * cfg.w_reset; why[#why + 1] = "jitter phase was just reset" end
+            if al.it == 3 or al.it == 4 then aw = aw * cfg.w_teleport; why[#why + 1] = "you were teleporting / returning (ideal tick)" end
+            if al.def then aw = aw * cfg.w_defensive; why[#why + 1] = "defensive was active" end
+        end
+        local info = kind == "dodge" and (rec.w or 1) or 1
+        local w = aw * info
+        local pid = rec.pid
+        local p_eff = 1
+        if g and i then
+            if not (al.danger and RAP.v("ai.explore_safe")) and i == AI.cur[g] then p_eff = AI.prop[g] or 1 end
+        end
+        local pred = (g and i and AI.st[g]) and (AI.post(g, i, pid)) or nil
+        local smp = { sid = rec.sid, did = g and AI.did[g], g = g, i = i, y = y, b = b, adv = y - b, w = w, aw = aw, p = p_eff, pred = pred,
+            grp = rec.grp, why = table.concat(why, ", "), fine = fine, mq = rec.mq }
+        rec.sample = smp
+        RAP.CONF = RAP.CONF or {}
+        RAP.CONF.eshot = { w = aw, why = smp.why, r = kind, t = globals.realtime }
+        if w > 0 and pred then L.calib_add("aa", pred, y, w) end
+        L.mark()
+        if RAP.tele and RAP.tele.apush then
+            local function r2(x) return x and U.round(x * 100) / 100 or nil end
+            RAP.tele.apush({ t = U.round(globals.realtime * 10) / 10, g = g, p = i, how = g and AI.how[g], cur = g and AI.cur[g], k = kind, hg = rec.hitgroup,
+                w0 = r2(info), aw = r2(aw), wc = ctx.wc, d = rec.dist and U.round(rec.dist) or nil,
+                sid = rec.sid, did = smp.did, pr = r2(p_eff), o = y, b = r2(b), av = r2(smp.adv), gp = rec.grp, dg = al.danger and 1 or 0,
+                rs = al.reset and 1 or 0, it = al.it, mq = rec.mq, pd = r2(pred), rv = 2 })
+        end
+        -- изменение поведения врага: наши увороты от него резко хуже базовой линии -> его статистика AA ослабляется
+        if w >= 0.5 and pid then
+            local fired, drop, n = L.ph_add("aa|" .. pid, smp.adv)
+            if fired then
+                for _, row in pairs(AI.ebd[pid] or {}) do for _, x in pairs(row) do x[1], x[2] = x[1] * 0.5, x[2] * 0.5 end end
+                for _, row in pairs(AI.eadv[pid] or {}) do for _, a in pairs(row) do L.acc_decay(a, 0.5) end end
+                RAP.dl.note("cp", pid, "aa", "down-weight", string.format("Page-Hinkley drop %.2f over %d enemy shots", drop, n), "detected")
+                if RAP.v("ai.logs") then U.log("ai", "%s: behaviour change detected (PH %.2f, %d shots) -> per-enemy AA stats x0.5", pid, drop, n) end
+            end
+        end
+    end, 5)
     RAP.on("enemy_shot", "ai", function(kind, rec)
         local g, i = rec.ctx.group, rec.ctx.profile
         if not g or not i or RAP.v("aa.source") == "Builder" then return end
         if kind ~= "dodge" and kind ~= "hit" then return end
+        -- v60: обучение - только из выборки (rec.sample)
+        local smp = rec.sample
+        if not smp then return end
         local dodge = kind == "dodge"
-        local aw, awhy = AI.attr(kind, rec)
-        local w0 = dodge and (rec.w or 1) or (rec.hitgroup == 1 and 1.5 or 1)
-        local w = w0 * aw
-        RAP.CONF = RAP.CONF or {}
-        RAP.CONF.eshot = { w = aw, why = awhy, r = kind, t = globals.realtime }
-        if RAP.tele and RAP.tele.apush then
-            RAP.tele.apush({ t = U.round(globals.realtime * 10) / 10, g = g, p = i, how = AI.how[g], cur = AI.cur[g], k = kind, hg = rec.hitgroup,
-                w0 = U.round(w0 * 100) / 100, aw = U.round(aw * 100) / 100, wc = rec.ctx.wc, d = rec.dist and U.round(rec.dist) or nil })
-        end
+        local aw, w = smp.aw, smp.w
         if aw <= 0 then return end
+        -- преимущество профиля (и против этого врага): группа независимости - серия DT одного стрелка
+        local L = RAP.learn
+        AI.adv[g] = AI.adv[g] or {}
+        AI.adv[g][i] = AI.adv[g][i] or L.acc_new()
+        local gamma = (RAP.v("ai.memory") or 95) / 100
+        for _, a in pairs(AI.adv[g]) do L.acc_decay(a, gamma ^ 0.1) end
+        L.acc_add(AI.adv[g][i], w, smp.adv, smp.grp)
+        if rec.pid and RAP.W.learn(rec.pid) then
+            local e = AI.eadv[rec.pid]
+            if not e then e = {}; AI.eadv[rec.pid] = e end
+            e[g] = e[g] or {}
+            e[g][i] = e[g][i] or L.acc_new()
+            L.acc_add(e[g][i], w, smp.adv, smp.grp)
+        end
         RAP.store.mark(KEY)
         AI.bd[g] = AI.bd[g] or {}
         bd_note(AI.bd[g], i, dodge, w)
@@ -3974,12 +4165,19 @@ do
         end
         local bdw = {}
         for wk, row in pairs(AI.bdw) do bdw[wk] = pack(row) end
+        local adv, eadv = {}, {}
+        for g, row in pairs(AI.adv) do adv[g] = {}; for i, a in pairs(row) do adv[g][tostring(i)] = RAP.learn.acc_pack(a) end end
+        for _, pid in ipairs(freshest(AI.eadv, 48)) do
+            eadv[pid] = {}
+            for g, row in pairs(AI.eadv[pid]) do eadv[pid][g] = {}; for i, a in pairs(row) do eadv[pid][g][tostring(i)] = RAP.learn.acc_pack(a) end end
+        end
         local ets = {}
-        for pid, t in pairs(AI.ets) do if AI.en[pid] or AI.ebd[pid] then ets[pid] = t else AI.ets[pid] = nil end end
-        RAP.store.set(KEY, { st = AI.st, en = en, sm = sm, bd = bd, ebd = ebd, bdw = bdw, ets = ets })
+        for pid, t in pairs(AI.ets) do if AI.en[pid] or AI.ebd[pid] or AI.eadv[pid] then ets[pid] = t else AI.ets[pid] = nil end end
+        RAP.store.set(KEY, { st = AI.st, en = en, sm = sm, bd = bd, ebd = ebd, bdw = bdw, ets = ets, adv = adv, eadv = eadv })
     end)
     function AI.reset()
         AI.st, AI.en, AI.sm, AI.cur, AI.bd, AI.ebd, AI.bdw, AI.since, AI.how, AI.ets = fresh_groups(), {}, {}, {}, {}, {}, {}, {}, {}, {}
+        AI.adv, AI.eadv = {}, {}
         RAP.store.set(KEY, nil)
         print("[ai] AA learning reset")
     end
@@ -5519,6 +5717,7 @@ do
         if e and e.target then local okh, h = pcall(U.getf, e.target, "m_iHealth"); if okh and type(h) == "number" then hp = h end end
         local ch = charge()
         local can_dt = R.on(R.dt) and ch >= 1 and not (W.widx and SINGLE[W.widx])
+        rec.itc, rec.grp = now_t, "it" .. now_t                   -- первая пуля цикла: та же группа независимости, что и вторая
         IT.cyc = { shot_tick = now_t, shot_rt = globals.realtime, shots = 1, target = e and e.target, idx = rec.idx, est = e and e.damage or 0,
             hp = hp, lethal = (e and (e.damage or 0) >= hp) or false, can_dt = can_dt, ch_shot = ch, wgroup = W.wgroup }
         set_state("SHOT")

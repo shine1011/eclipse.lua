@@ -114,9 +114,12 @@ test("decisions: phase shift that makes the enemy hit more is rolled back", func
     local E = S.load(PATH)
     local RAP = E.RAP
     RAP.W.learn = function() return true end
-    local ai = E.hook("enemy_shot", "ai")
+    local smp, ai = E.hook("enemy_shot", "learn sample aa"), E.hook("enemy_shot", "ai")
+    local sid = 0
     local function shot(kind, flip)
-        ai(kind, { pid = "x:9", w = 1, dist = 10, hitgroup = 1, ctx = { group = "stand", profile = 9, applied = true, flip = flip, wc = "rifle" } })
+        sid = sid + 1
+        local rec = { sid = sid, grp = sid, pid = "x:9", w = 1, dist = 10, hitgroup = 1, ctx = { group = "stand", profile = 9, applied = true, flip = flip, wc = "rifle" } }
+        smp(kind, rec); ai(kind, rec)
     end
     E.T.now = 1000
     for _ = 1, 6 do shot("hit", true); shot("dodge", false) end
@@ -428,19 +431,28 @@ test("head policy: lethal body (auto, 40 hp, armor) forces body; pistol at 40 hp
     no_errors(E); no_errors(E2)
 end)
 
+-- наш выстрел через полный путь обучения: выборка (learn sample) -> learner (strategy)
+local SIDN = 0
+local function our_ack(E, rec, ev)
+    SIDN = SIDN + 1
+    rec.sid = rec.sid or (100000 + SIDN)
+    E.hook("our_ack", "learn sample")(rec, ev)
+    E.hook("our_ack", "strategy")(rec, ev)
+end
+
 test("strategy reward: share of target HP (kill = 1), old hit stats only a weak prior", function()
     local E = S.load(PATH)
     local ST = E.RAP.strat
     local rec = { idx = 5, pid = "x:1", hp0 = 100, ctx = { arm = 2, key = "x:1|Scout|jitter", wg = "Scout", aatk = "jitter", attr = 1 } }
-    E.hook("our_ack", "strategy")(rec, { state = nil, damage = 100, hitgroup = 1 })
+    our_ack(E, rec, { state = nil, damage = 100, hitgroup = 1 })
     local x = ST.ctx["x:1|Scout|jitter"].arms[2]
     assert(math.abs(x.vh - 1) < 1e-6 and math.abs(x.vm) < 1e-6, "kill must be reward 1")
-    rec.hp0 = 100
-    E.hook("our_ack", "strategy")(rec, { state = nil, damage = 25, hitgroup = 3 })
+    rec = { idx = 5, pid = "x:1", hp0 = 100, ctx = { arm = 2, key = "x:1|Scout|jitter", wg = "Scout", aatk = "jitter", attr = 1 } }
+    our_ack(E, rec, { state = nil, damage = 25, hitgroup = 3 })
     assert(math.abs(x.vh - (0.985 + 0.25)) < 0.01, "body 25 dmg must be 0.25: " .. x.vh)
     -- голова (2 убийства) против тела с теми же попаданиями: оценка головы выше
     local key = "x:2|Auto|jitter"
-    local function ack(arm, dmg) E.hook("our_ack", "strategy")({ idx = 6, pid = "x:2", hp0 = 100, ctx = { arm = arm, key = key, wg = "Auto", aatk = "jitter", attr = 1 } },
+    local function ack(arm, dmg) our_ack(E, { idx = 6, pid = "x:2", hp0 = 100, ctx = { arm = arm, key = key, wg = "Auto", aatk = "jitter", attr = 1 } },
         { state = nil, damage = dmg, hitgroup = arm == 2 and 1 or 3 }) end
     for _ = 1, 3 do ack(2, 100); ack(6, 30) end
     assert(ST.post(key, 2, "Auto", "jitter") > ST.post(key, 6, "Auto", "jitter"), "head kills must beat body chip damage")
@@ -536,6 +548,20 @@ test("learn: AA exploration propensities match the empirical choice frequencies"
     local L = E.RAP.learn
     local d = L.dec[L.dec_n]
     assert(d.sys == "aa" and d.ch == 10 and math.abs(d.p - 0.05) < 1e-9 and d.why == "explore" and d.verify == false)
+end)
+
+test("learn: one sample per shot_id (no double counting), effective-only learning", function()
+    local E = S.load(PATH)
+    local ST = E.RAP.strat
+    local rec = { idx = 5, pid = "x:3", hp0 = 100, sid = 777, ctx = { arm = 4, key = "x:3|Auto|jitter", wg = "Auto", aatk = "jitter", attr = 1 } }
+    our_ack(E, rec, { state = nil, damage = 50, hitgroup = 3 })
+    E.hook("our_ack", "learn sample")(rec, { state = nil, damage = 50, hitgroup = 3 })   -- повтор того же shot_id
+    assert(E.RAP.learn.stats.dup == 1, "duplicate not detected")
+    assert(math.abs(ST.ctx["x:3|Auto|jitter"].arms[4].vh - 0.5) < 1e-6, "double counted")
+    local vm0 = ST.ctx["x:3|Auto|jitter"].arms[4].vm
+    local rec2 = { idx = 5, pid = "x:3", hp0 = 100, ctx = { arm = 4, key = "x:3|Auto|jitter", wg = "Auto", aatk = "jitter", attr = 0 } }
+    our_ack(E, rec2, { state = "correction" })
+    assert(ST.ctx["x:3|Auto|jitter"].arms[4].vm == vm0, "non-effective shot must not teach the arm")
 end)
 
 test("console_exec text is sanitized (trashtalk)", function()
