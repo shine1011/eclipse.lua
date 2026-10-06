@@ -195,7 +195,24 @@ do
             safe_head_dz = 45 },  -- v59: safe head только при реальном перепаде высоты (было 22 - ступенька / ящик)   -- v58: эксперимент / Evo-испытание только против врага дальше этого и когда ты не пикаешь        -- AI Peek: время скана за тик (мс), остаток направлений - на следующих тиках
         dormant = { hit_radius = 16 },   -- радиус (юниты) вокруг точки, попадание в который считается попаданием (оценка HC)
         log = { keep = 600 },      -- выстрелов в журнале (для сравнения версий)
-        db = { schema = 50 },
+        db = { schema = 60 },      -- v60: rap2_learn, поля выборок в журналах, lh / lm в стратегиях (миграция в модулях)
+        -- v60: причинная цепочка обучения (RAP.learn)
+        learn = {
+            base_k = 5,            -- усадка базовой линии: бакет -> грубый бакет -> общая, в "выстрелах"
+            base_decay = 0.995,    -- затухание базовой линии на каждое событие
+            min_ess = 2,           -- собственных эффективных выборок, чтобы уверенность была не "prior only"
+            calib_min = 60,        -- выборок до того, как калибровка начинает сжимать уверенность
+            shrink_min = 0.4,      -- сильнее не сжимать
+            adv_k = 4,             -- усадка преимущества профиля AA к 0 (в эффективных выборках)
+            adv_k_enemy = 10,      -- то же для преимущества против конкретного врага
+            old_prior = 4,         -- вес старых счетчиков AA (до v60) как приора, в выстрелах
+            ph_delta = 0.05,       -- Page-Hinkley: допуск
+            ph_lambda = 2.0,       -- порог срабатывания
+            ph_min_n = 8,          -- не раньше стольких выстрелов
+            w_reset = 0.6,         -- выстрел врага сразу после случайного сброса фазы jitter (v58)
+            w_teleport = 0.3,      -- выстрел врага, пока ты в телепорте / возврате ideal tick
+            w_defensive = 0.6,     -- выстрел врага во время defensive
+        },
     }
     local saved = RAP.store.get("rap2_cfg") or {}
     local CFG = {}
@@ -709,6 +726,215 @@ do
         if W.upd_rt and (rt - W.upd_rt > 0.25 or rt < W.upd_rt) then W.upd_rt = nil; drop_snapshot() end
     end, 0)
     RAP.on("level", "world snapshot", function() W.upd_rt = nil; drop_snapshot() end)
+end
+---------------------------------------------------------------- learn: причинная цепочка обучения (v60)
+-- решение -> снимок контекста -> выстрел -> атрибуция -> взвешенная выборка -> уверенность -> проверка -> обучение ->
+-- обнаружение изменения поведения. Здесь - общие кирпичи, которыми пользуются Strategy AI, AA AI, phase и evo:
+--   L.decide      - решение с decision_id, числом вариантов, выбранным, вероятностью выбора (propensity) и причиной;
+--   L.next_shot   - shot_id; L.sample(sid) - выборка пишется ровно один раз (идемпотентно по shot_id);
+--   L.acc_*       - взвешенный аккумулятор с группами независимости: Kish ESS = (Σw)^2 / Σ W_g^2, W_g - вес группы
+--                   (вторая пуля DT, тот же стрелок в серии) - коррелированные выстрелы не добавляют данных;
+--   L.base_*      - базовая линия E[y | контекст]: бакет -> грубый бакет -> общая, с усадкой (k = CFG.learn.base_k);
+--   L.p_better    - единая уверенность P(A лучше B) с поправкой калибровки; L.level - "prior only", пока своих данных мало;
+--   L.calib_*     - калибровка: предсказание на момент решения vs исход (таблица надежности, Brier, наклон);
+--   L.ph_add      - Page-Hinkley: падение преимущества против конкретного врага = он сменил поведение.
+-- Все - плоские таблицы чисел, без аллокаций в тике (выборки и решения - события, не тики).
+do
+    local U = RAP.U
+    local KEY = "rap2_learn"
+    local L = { did = 0, sid = 0, dec = {}, dec_n = 0, seen = {}, seen_q = {}, seen_i = 0, base = { aa = {}, st = {} },
+        calib = {}, ph = {}, stats = { samples = 0, dup = 0 } }
+    RAP.learn = L
+    local function C() return RAP.CFG.learn end
+
+    ---------------- решения и выстрелы
+    local DEC_MAX = 300
+    -- sys: "strat" | "aa" | "phase" | "evo"; why: exploit / explore / guard / panic / rollback / forced / ...
+    -- p - вероятность, с которой ВЫБРАННЫЙ вариант был выбран политикой в этом контексте (1 - детерминированно)
+    function L.decide(sys, key, n_opt, chosen, p, why, verify)
+        L.did = L.did + 1
+        L.dec_n = L.dec_n % DEC_MAX + 1
+        local d = L.dec[L.dec_n]
+        if not d then d = {}; L.dec[L.dec_n] = d end
+        d.id, d.sys, d.key, d.n, d.ch, d.p, d.why, d.t, d.verify = L.did, sys, tostring(key), n_opt or 0, chosen, U.clamp(p or 1, 0, 1), why or "-", globals.realtime, verify and true or false
+        return L.did
+    end
+    function L.next_shot() L.sid = L.sid + 1; return L.sid end
+    -- выборка по shot_id - ровно один раз (повторный вызов, например при позднем событии, игнорируется)
+    local SEEN_MAX = 2048
+    function L.sample(sid)
+        if not sid then return false end
+        if L.seen[sid] then L.stats.dup = L.stats.dup + 1; return false end
+        L.seen[sid] = true
+        L.seen_i = L.seen_i % SEEN_MAX + 1
+        local old = L.seen_q[L.seen_i]
+        if old then L.seen[old] = nil end
+        L.seen_q[L.seen_i] = sid
+        L.stats.samples = L.stats.samples + 1
+        return true
+    end
+
+    ---------------- аккумулятор с группами независимости
+    function L.acc_new() return { sw = 0, swy = 0, swy2 = 0, sW2 = 0, W = 0, g = false, n = 0 } end
+    function L.acc_add(a, w, y, grp)
+        if not w or w <= 0 then return end
+        a.sw, a.swy, a.swy2, a.n = a.sw + w, a.swy + w * y, a.swy2 + w * y * y, a.n + 1
+        if grp ~= nil and grp == a.g then
+            a.sW2 = a.sW2 + (a.W + w) ^ 2 - a.W ^ 2         -- тот же коррелированный блок: вес группы растет, n_eff - нет
+            a.W = a.W + w
+        else
+            a.sW2, a.W, a.g = a.sW2 + w * w, w, grp ~= nil and grp or false
+        end
+    end
+    function L.acc_decay(a, d)
+        a.sw, a.swy, a.swy2, a.sW2, a.W = a.sw * d, a.swy * d, a.swy2 * d, a.sW2 * d * d, a.W * d
+    end
+    function L.acc_ess(a) if not a or a.sW2 <= 0 then return 0 end; return a.sw * a.sw / a.sW2 end
+    function L.acc_mean(a) if not a or a.sw <= 0 then return 0 end; return a.swy / a.sw end
+    -- дисперсия среднего: s^2 / ESS (s^2 - взвешенная дисперсия наблюдений, не меньше пола)
+    function L.acc_var(a, floor)
+        local ess = L.acc_ess(a)
+        if ess <= 0 then return 1 end
+        local m = a.swy / a.sw
+        local s2 = U.max(floor or 0.05, a.swy2 / a.sw - m * m)
+        return s2 / ess
+    end
+    function L.acc_load(t)
+        local a = L.acc_new()
+        if type(t) ~= "table" then return a end
+        for k in pairs(a) do if k ~= "g" then a[k] = U.num(t[k], -1e6, 1e6) or 0 end end
+        a.sW2 = U.max(0, a.sW2)
+        return a
+    end
+    function L.acc_pack(a)
+        local function r(x) return U.round(x * 1000) / 1000 end
+        return { sw = r(a.sw), swy = r(a.swy), swy2 = r(a.swy2), sW2 = r(a.sW2), W = r(a.W), n = a.n }
+    end
+
+    ---------------- базовая линия E[y | контекст]
+    -- иерархия: бакет (fine) -> грубый (coarse) -> общая (*), каждый уровень усаживается к следующему с весом k
+    local function bnode(t, key) local b = t[key]; if not b then b = { n = 0, s = 0 }; t[key] = b end; return b end
+    function L.base_get(sys, fine, coarse)
+        local T, k = L.base[sys], C().base_k
+        local g = T["*"]
+        local gm = (g and g.n > 0) and g.s / g.n or 0.5
+        local c = coarse and T[coarse]
+        local cm = c and (c.s + k * gm) / (c.n + k) or gm
+        local f = fine and T[fine]
+        local fm = f and (f.s + k * cm) / (f.n + k) or cm
+        return fm, (f and f.n or 0)
+    end
+    function L.base_add(sys, fine, coarse, y, w)
+        local T, d = L.base[sys], C().base_decay
+        w = w or 1
+        for _, key in ipairs({ "*", coarse, fine }) do
+            if key then local b = bnode(T, key); b.n, b.s = b.n * d + w, b.s * d + w * y end
+        end
+    end
+
+    ---------------- калибровка
+    local function cal(sys)
+        local c = L.calib[sys]
+        if not c then c = { n = 0, brier = 0, sxy = 0, sxx = 0, bins = {} }; for i = 1, 10 do c.bins[i] = { n = 0, sp = 0, sy = 0 } end; L.calib[sys] = c end
+        return c
+    end
+    L.cal = cal
+    function L.calib_add(sys, pred, y, w)
+        if not pred or w == nil or w <= 0 then return end
+        local c = cal(sys)
+        pred = U.clamp(pred, 0, 1)
+        local b = c.bins[U.clamp(math.floor(pred * 10) + 1, 1, 10)]
+        b.n, b.sp, b.sy = b.n + w, b.sp + w * pred, b.sy + w * y
+        c.n, c.brier = c.n + w, c.brier + w * (pred - y) ^ 2
+        c.sxy, c.sxx = c.sxy + w * (pred - 0.5) * (y - 0.5), c.sxx + w * (pred - 0.5) ^ 2
+    end
+    -- наклон калибровки: y - 0.5 ~ s * (pred - 0.5). s < 1 - модель переуверена (крайние предсказания сбываются хуже)
+    function L.calib_slope(sys)
+        local c = L.calib[sys]
+        if not c or c.n < C().calib_min or c.sxx <= 1e-6 then return 1, c and c.n or 0 end
+        return U.clamp(c.sxy / c.sxx, 0, 1.5), c.n
+    end
+    -- поправка уверенности: при переуверенности (s < 1) z-оценки сжимаются (не растягиваются, если s > 1)
+    function L.shrink(sys) local s = L.calib_slope(sys); return U.clamp(s, C().shrink_min, 1) end
+
+    ---------------- единая уверенность
+    local function phi(z)
+        local s, x = z < 0 and -1 or 1, U.abs(z) / 1.41421356
+        local t = 1 / (1 + 0.3275911 * x)
+        local y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * math.exp(-x * x)
+        return 0.5 * (1 + s * y)
+    end
+    L.phi = phi
+    function L.p_better(m1, v1, m2, v2, sys)
+        local z = (m1 - m2) / U.sqrt(U.max((v1 or 0) + (v2 or 0), 1e-6))
+        return phi(z * (sys and L.shrink(sys) or 1))
+    end
+    -- уровень уверенности с учетом СОБСТВЕННЫХ данных: пока своих выборок меньше min_ess, это только приор
+    function L.level(p, ess_own, min_ess)
+        if (ess_own or 0) < (min_ess or C().min_ess) then return "prior only" end
+        return RAP.conf_level and RAP.conf_level(p) or tostring(p)
+    end
+
+    ---------------- Page-Hinkley: падение среднего (преимущества) в потоке
+    -- x_t - преимущество выстрела против врага; m - накопленное среднее; PH = Σ(x - m + delta), срабатывание при
+    -- max(PH) - PH > lambda (среднее упало). После срабатывания - сброс.
+    function L.ph_add(key, x)
+        local cfg = C()
+        local s = L.ph[key]
+        if not s then s = { n = 0, mean = 0, ph = 0, mx = 0 }; L.ph[key] = s end
+        s.n = s.n + 1
+        s.mean = s.mean + (x - s.mean) / s.n
+        s.ph = s.ph + (x - s.mean + cfg.ph_delta)
+        if s.ph > s.mx then s.mx = s.ph end
+        if s.n >= cfg.ph_min_n and s.mx - s.ph > cfg.ph_lambda then
+            local drop = s.mx - s.ph
+            L.ph[key] = nil
+            return true, drop, s.n
+        end
+        return false, s.mx - s.ph, s.n
+    end
+
+    ---------------- хранение
+    do
+        local d = RAP.store.get(KEY)
+        if type(d) == "table" then
+            for _, sys in ipairs({ "aa", "st" }) do
+                if type(d.base) == "table" and type(d.base[sys]) == "table" then
+                    for k, b in pairs(d.base[sys]) do
+                        if type(k) == "string" and type(b) == "table" and U.num(b.n, 0) then L.base[sys][k] = { n = U.num(b.n, 0, 1e6), s = U.num(b.s, -1e6, 1e6) or 0 } end
+                    end
+                end
+            end
+            if type(d.calib) == "table" then
+                for sys, c in pairs(d.calib) do
+                    if type(sys) == "string" and type(c) == "table" and type(c.bins) == "table" then
+                        local cc = cal(sys)
+                        cc.n, cc.brier, cc.sxy, cc.sxx = U.num(c.n, 0) or 0, U.num(c.brier, 0) or 0, U.num(c.sxy) or 0, U.num(c.sxx, 0) or 0
+                        for i = 1, 10 do local b = c.bins[i] or c.bins[tostring(i)]; if type(b) == "table" then cc.bins[i] = { n = U.num(b.n, 0) or 0, sp = U.num(b.sp, 0) or 0, sy = U.num(b.sy, 0) or 0 } end end
+                    end
+                end
+            end
+            L.did, L.sid = U.num(d.did, 0) or 0, U.num(d.sid, 0) or 0
+        end
+    end
+    function L.mark() RAP.store.mark(KEY) end
+    RAP.on("save", "learn", function(force)
+        if not RAP.v("main.persist") or not RAP.store.need(KEY, force) then return end
+        local function r(x) return U.round(x * 1000) / 1000 end
+        local base = { aa = {}, st = {} }
+        for sys, T in pairs(L.base) do
+            -- слабые бакеты (вес < 0.05) не сохраняются - база не растет бесконечно
+            for k, b in pairs(T) do if b.n >= 0.05 then base[sys][k] = { n = r(b.n), s = r(b.s) } end end
+        end
+        local calib = {}
+        for sys, c in pairs(L.calib) do
+            local bins = {}
+            for i = 1, 10 do bins[i] = { n = r(c.bins[i].n), sp = r(c.bins[i].sp), sy = r(c.bins[i].sy) } end
+            calib[sys] = { n = r(c.n), brier = r(c.brier), sxy = r(c.sxy), sxx = r(c.sxx), bins = bins }
+        end
+        RAP.store.set(KEY, { base = base, calib = calib, did = L.did, sid = L.sid })
+    end)
+    RAP.resets.learn = function() L.base, L.calib, L.ph = { aa = {}, st = {} }, {}, {} end
 end
 ---------------------------------------------------------------- shots: выстрелы врагов по тебе и твои выстрелы
 -- Выстрел врага собирается из трех событий в любом порядке (на живом сервере bullet_fire приходит до 0.6 с позже
@@ -2669,7 +2895,7 @@ do
     local U = RAP.U
     local set = RAP.aaset
     local S = { sent = 0, flip = false, left = 1, cycle = false, manual = 0, brute_until = 0, brute_flip = false,
-        brute_shift = 0, lim_until = 0, def_until = 0, prev_hit = false, fh = {}, prev = {}, ro = 0, mod_rand = 0, flick_base = 0, names = {} }
+        brute_shift = 0, lim_until = 0, def_until = 0, prev_hit = false, prev = {}, ro = 0, mod_rand = 0, flick_base = 0, names = {} }
     local AA = { S = S }
     RAP.aa = AA
     local GROUP = { stand = "stand", move = "move", slow = "slow", air = "air", airduck = "air", duck = "duck" }
@@ -2687,30 +2913,7 @@ do
     -- известно с ошибкой (пинг, интерполяция), поэтому если в окне +-tol сторона менялась - ответ nil (неизвестно):
     -- при fast jitter сторона меняется каждый тик, и угаданная сторона была бы шумом в статистике phase shift.
     local SIDE_TOL = 0.05
-    local function flip_at(t)
-        local side, known = nil, false
-        for _, e in ipairs(S.fh) do
-            if e[1] <= t then side, known = e[2], true end
-        end
-        if not known then return nil end
-        for _, e in ipairs(S.fh) do
-            if e[1] >= t - SIDE_TOL and e[1] <= t + SIDE_TOL and e[2] ~= side then return nil end
-        end
-        return side
-    end
-    AA.flip_at = flip_at
-    -- профиль на момент t: если в окне [t - 0.25, t] профиль менялся, враг мог стрелять по прошлому - выстрел неоднозначен
-    local function profile_mixed(t)
-        local seen
-        for _, e in ipairs(S.fh) do
-            if e[1] >= t - 0.25 and e[1] <= t + SIDE_TOL and e[3] then
-                if seen and seen ~= e[3] then return true end
-                seen = seen or e[3]
-            end
-        end
-        return false
-    end
-    AA.profile_mixed = profile_mixed
+    -- (v60: flip_at / profile_mixed по S.fh заменены кольцевым буфером AH и AA.aligned ниже)
     function AA.side_known(c)
         if not c or c.mode == "Random" then return false end
         if c.native and not RAP.v("ai.script_jit") then return false end
@@ -2898,7 +3101,10 @@ do
         end
         if RAP.v("aa.lim") == "After getting hit" then S.lim_until = now + bt end
     end
-    RAP.on("level", "aa brute", function() S.bhits, S.bflips, S.last_brute, S.brute_until, S.lim_until, S.def_until, S.fh, AA.def = {}, {}, nil, 0, 0, 0, {}, nil end)
+    RAP.on("level", "aa brute", function() S.bhits, S.bflips, S.last_brute, S.brute_until, S.lim_until, S.def_until, AA.def = {}, {}, nil, 0, 0, 0, nil
+        -- новая карта: curtime начался заново - старые записи буфера AA недействительны
+        if AA.AH then for k = 1, 256 do AA.AH.t[k] = nil end end
+    end)
     RAP.on("enemy_shot", "aa brute", function(kind, rec)
         local now = globals.curtime
         if kind == "hit" then AA.brute_hit(rec)
@@ -2926,19 +3132,29 @@ do
     end)
     -- состояние на момент выстрела врага (для AI и hit-side memory)
     RAP.on("enemy_shot_start", "aa ctx", function(rec)
-        rec.ctx.group = AA.group_of(RAP.W.state)
-        rec.ctx.profile = AA.cur_index
-        rec.ctx.known = AA.side_known(AA.cur)
-        local tq = globals.curtime - (RAP.W.ping_s or 0.06)
-        rec.ctx.flip = rec.ctx.known and flip_at(tq)
-        if rec.ctx.flip == false and not rec.ctx.known then rec.ctx.flip = nil end
-        rec.ctx.mixed = profile_mixed(tq)
-        -- реально ли стоял профиль: manual / safe head / legit / лестница заменяют его целиком, freestanding - yaw
-        rec.ctx.applied = AA.active and AA.cur ~= nil and AA.mode == AA.cur.name and S.manual == 0 and not AA.safe
-        rec.ctx.fs, rec.ctx.brute = AA.fs and true or false, AA.brute and true or false
+        -- v60: все поля - из выровненного по задержке тика (AA.aligned), а не из текущего состояния
+        local al = AA.aligned(rec.t or globals.curtime, {})
+        rec.ctx.al = al
+        if al.ok then
+            rec.ctx.group = al.group or AA.group_of(RAP.W.state)
+            rec.ctx.profile = al.profile ~= 0 and al.profile or nil
+            rec.ctx.flip = al.flip
+            rec.ctx.mixed = al.mixed
+            rec.ctx.applied = al.mode == 0 and al.profile ~= 0
+            rec.ctx.fs = al.fs
+        else
+            -- истории еще нет (первые тики после загрузки): как раньше, по текущему состоянию, но выстрел помечен
+            rec.ctx.group = AA.group_of(RAP.W.state)
+            rec.ctx.profile = AA.cur_index
+            rec.ctx.flip = nil
+            rec.ctx.mixed = true
+            rec.ctx.applied = false
+            rec.ctx.fs = AA.fs and true or false
+        end
+        rec.ctx.brute = AA.brute and true or false
     end)
 
-    local function run(cmd)
+    local function run_inner(cmd)
         local W = RAP.W
         if not RAP.v("aa.on") or not W.alive then
             if AA.active then RAP.aa_release(); AA.active = false end
@@ -2977,12 +3193,18 @@ do
             -- дуэли (враг может попасть и ближе explore_far) или на пике ставится лучший профиль группы.
             AA.guard = false
             local how = RAP.ai and RAP.ai.how[group]
-            if (how == "explore" or how == "evo") and RAP.v("ai.explore_safe") and W.can_hit_me then
+            -- v60: вердикт guard ("опасно": враг может попасть и близко, или ты пикаешь) считается КАЖДЫЙ тик - это
+            -- контекстная переменная, от которой зависит, какой профиль стоит; она идет в бакет базовой линии
+            AA.danger = false
+            if W.can_hit_me then
                 local K = RAP.CFG.aa_ai
                 local tcx = RAP.TC[W.can_hit_me:get_index()]
                 local dist = tcx and tcx.geo.dist or 0
                 local spd = W.vel and W.vel:length2d() or 0
-                if dist < K.explore_far or spd > K.peek_speed then
+                AA.danger = dist < K.explore_far or spd > K.peek_speed
+            end
+            if (how == "explore" or how == "evo") and RAP.v("ai.explore_safe") and W.can_hit_me then
+                if AA.danger then
                     local pid = RAP.W.pid(W.can_hit_me)
                     local b = RAP.ai.best(group, nil, pid)
                     if b and b ~= idx then idx, AA.guard = b, true end
@@ -3000,7 +3222,6 @@ do
         if inv then yaw = 2 * (c.offset or 0) - yaw; flip = not flip end
         local brute = now < S.brute_until
         if brute then yaw = yaw + S.brute_shift; if S.brute_flip then flip = not flip end end
-        if S.cycle then S.fh[#S.fh + 1] = { now, flip, idx or 0 }; if #S.fh > 40 then table.remove(S.fh, 1) end end
         AA.brute, AA.flip = brute, flip
 
         local native = c.native and S.manual == 0
@@ -3089,6 +3310,87 @@ do
             set("hidden", false)
         end
         AA.mode = AA.safe and "safe head" or c.name
+    end
+    -- v60: кольцевой буфер ПРИМЕНЕННОГО состояния AA по тикам (массивы чисел, без аллокаций). По нему выстрел врага
+    -- выравнивается на момент, который он видел: t - (ping + interp + choke), а не на текущий тик.
+    local AH_N = 256
+    local AH = { i = 0, t = {}, prof = {}, flip = {}, sk = {}, guard = {}, danger = {}, reset = {}, it = {}, def = {}, fs = {}, mode = {}, spd = {}, choke = {}, grp = {} }
+    AA.AH = AH
+    local IT_CODE = { OFF = 0, READY = 1, PEEK = 2, SHOT = 3, RETURN = 4, RECHARGE = 5 }
+    local MODE_CODE = { profile = 0, ["safe head"] = 1, manual = 2, legit = 3, skip = 4, off = 5 }
+    local GROUP_IDX = {}
+    for k, g in ipairs(AA.GROUPS) do GROUP_IDX[g] = k end
+    AA.MODE_NAME = { [0] = "profile", "safe head", "manual", "legit", "skip", "off" }
+    local function ah_push(cmd)
+        local W = RAP.W
+        AH.i = AH.i % AH_N + 1
+        local i = AH.i
+        local now = globals.curtime
+        local mode
+        if not AA.active then mode = (AA.mode == "ladder" or AA.mode == "warmup") and MODE_CODE.skip or MODE_CODE.off
+        elseif AA.mode == "legit" then mode = MODE_CODE.legit
+        elseif AA.safe then mode = MODE_CODE["safe head"]
+        elseif (S.manual or 0) ~= 0 then mode = MODE_CODE.manual
+        else mode = MODE_CODE.profile end
+        AH.t[i], AH.prof[i], AH.mode[i] = now, (AA.active and AA.cur_index) or 0, mode
+        AH.flip[i] = AA.flip and 1 or 0
+        AH.sk[i] = (AA.active and AA.side_known(AA.cur)) and 1 or 0
+        AH.guard[i], AH.danger[i] = AA.guard and 1 or 0, AA.danger and 1 or 0
+        local rt = globals.realtime
+        AH.reset[i] = (S.shot_reset_t and rt >= S.shot_reset_t and rt - S.shot_reset_t < 0.3) and 1 or 0
+        AH.it[i] = IT_CODE[RAP.it and RAP.it.st or "OFF"] or 0
+        AH.def[i] = (AA.def == now) and 1 or 0
+        AH.fs[i] = AA.fs and 1 or 0
+        AH.spd[i] = W.vel and W.vel:length2d() or 0
+        AH.choke[i] = cmd and cmd.choked_commands or 0
+        AH.grp[i] = GROUP_IDX[AA.group or ""] or 0
+    end
+    -- индекс записи на момент t: последняя запись с t_i <= t (не из будущего)
+    local function ah_find(t)
+        local i = AH.i
+        for _ = 1, AH_N do
+            local ti = AH.t[i]
+            if not ti then return nil end
+            if ti <= t then return i end
+            i = (i - 2) % AH_N + 1
+        end
+        return nil
+    end
+    -- выровненный снимок AA для выстрела врага в момент t_evt (curtime получения события): профиль / сторона / флаги на
+    -- момент, который враг видел. mixed - профиль или режим менялся в окне +-mix_w (выстрел неоднозначен);
+    -- side = nil, если сторона менялась в окне +-SIDE_TOL (fast jitter - сторона неизвестна).
+    function AA.aligned(t_evt, out)
+        local W = RAP.W
+        local ti = globals.tickinterval or (1 / 64)
+        local choke = AH.choke[AH.i] or 0
+        local lag = (W.ping_s or 0.06) + 0.031 + choke * ti
+        local tq = t_evt - lag
+        local j = ah_find(tq)
+        out.lag, out.tq = lag, tq
+        if not j then out.ok = false; return out end
+        out.ok = true
+        out.profile, out.mode, out.guard, out.danger = AH.prof[j], AH.mode[j], AH.guard[j] == 1, AH.danger[j] == 1
+        out.reset, out.it, out.def, out.fs, out.spd = AH.reset[j] == 1, AH.it[j], AH.def[j] == 1, AH.fs[j] == 1, AH.spd[j]
+        out.group = AA.GROUPS[AH.grp[j]] or nil
+        local mix_w, side_w = 1.5 * ti, SIDE_TOL
+        local mixed, side_ch = false, false
+        local i = AH.i
+        for _ = 1, AH_N do
+            local t2 = AH.t[i]
+            if not t2 or t2 < tq - side_w then break end
+            if t2 <= tq + side_w then
+                if AH.flip[i] ~= AH.flip[j] then side_ch = true end
+                if t2 >= tq - mix_w and t2 <= tq + mix_w and (AH.prof[i] ~= AH.prof[j] or AH.mode[i] ~= AH.mode[j]) then mixed = true end
+            end
+            i = (i - 2) % AH_N + 1
+        end
+        out.mixed = mixed
+        if AH.sk[j] == 1 and not side_ch then out.flip = AH.flip[j] == 1 else out.flip = nil end
+        return out
+    end
+    local function run(cmd)
+        run_inner(cmd)
+        ah_push(cmd)
     end
     RAP.on("tick", "aa engine", run, 30)
     RAP.on("shutdown", "aa", function() RAP.aa_release() end)

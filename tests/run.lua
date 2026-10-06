@@ -491,6 +491,33 @@ test("safe head keeps desync and needs a real height advantage against an enemy 
     no_errors(E)
 end)
 
+test("learn: enemy shot is attributed to the AA profile live at (t - latency), not the current one", function()
+    local E = S.load(PATH)
+    local RAP = E.RAP
+    local me = S.player({ idx = 1, get_player_weapon = function() return nil end, get_eye_position = function() return vec(0, 0, 64) end,
+        get_origin = function() return vec() end })
+    local enemy = S.player({ idx = 3, get_origin = function() return vec(3000, 0, 0) end })
+    entity.get_local_player = function() return me end
+    entity.get_players = function(_, _, cb) cb(enemy) end
+    entity.get_threat = function() return enemy end
+    utils.net_channel = function() return { latency = { [0] = 0.05, [1] = 0.05 } } end     -- ping 100 ms
+    local AI = RAP.ai
+    local function tick() E.T.tick = E.T.tick + 1; E.T.now = E.T.now + 1 / 64; E.T.real = E.T.real + 1 / 64
+        E.fire("createmove", { choked_commands = 0, view_angles = vec() }) end
+    for _ = 1, 4 do tick() end
+    local g = RAP.aa.group
+    AI.cur[g], AI.how[g] = 9, "best"
+    for _ = 1, 30 do tick() end                      -- ~0.47 s с профилем 9
+    AI.cur[g] = 10
+    for _ = 1, 3 do tick() end                       -- профиль 10 стоит всего 3 тика (47 мс < 100 + 31 мс задержки)
+    local al = RAP.aa.aligned(E.T.now, {})
+    assert(al.ok and al.profile == 9, "aligned profile " .. tostring(al.profile) .. " (current is 10)")
+    assert(al.mixed == false, "1.5-tick window must not see the switch 3 ticks later")
+    local al2 = RAP.aa.aligned(E.T.now - 3 / 64 + 0.131, {})
+    assert(al2.mixed == true, "a shot aligned right at the switch must be marked mixed")
+    no_errors(E)
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP
