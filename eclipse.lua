@@ -969,6 +969,27 @@ do
         RAP.store.set(KEY, { base = base, calib = calib, did = L.did, sid = L.sid })
     end)
     RAP.resets.learn = function() L.base, L.calib, L.ph = { aa = {}, st = {} }, {}, {} end
+    -- /eclipse calib: таблица надежности (предсказание на момент решения vs исход), Brier, наклон, сжатие уверенности
+    RAP.cmd.calib = function()
+        local names = { st = "strategy (pred = estimated HP share, outcome = HP share)", aa = "AA profile (pred = dodge estimate, outcome = dodge)" }
+        for _, sys in ipairs({ "st", "aa" }) do
+            local c = L.calib[sys]
+            print("[calib] " .. names[sys])
+            if not c or c.n < 1 then print("[calib]   no samples yet")
+            else
+                local slope = L.calib_slope(sys)
+                print(string.format("[calib]   weighted n %.1f | Brier %.3f | slope %.2f%s | confidence shrink x%.2f", c.n, c.brier / c.n, slope,
+                    c.n < C().calib_min and string.format(" (inactive below n %d)", C().calib_min) or (slope < 0.9 and " (over-confident)" or ""), L.shrink(sys)))
+                for i = 1, 10 do
+                    local b = c.bins[i]
+                    if b.n >= 0.5 then
+                        print(string.format("[calib]   pred %3d-%3d%%: n %6.1f  mean pred %4.0f%%  observed %4.0f%%", (i - 1) * 10, i * 10, b.n, b.sp / b.n * 100, b.sy / b.n * 100))
+                    end
+                end
+            end
+        end
+        print(string.format("[calib] samples %d (duplicates rejected %d) | decisions logged %d | last shot id %d", L.stats.samples, L.stats.dup, L.did, L.sid))
+    end
 end
 ---------------------------------------------------------------- shots: выстрелы врагов по тебе и твои выстрелы
 -- Выстрел врага собирается из трех событий в любом порядке (на живом сервере bullet_fire приходит до 0.6 с позже
@@ -1522,6 +1543,9 @@ do
         if n < need then return end
         local pb = phi((m - d.pre_m) / U.sqrt(U.max(v + d.pre_v, 1e-6)))
         d.post_m, d.pb, d.post_n = m, pb, n
+        -- v60: каждый вердикт - с методом, разницей и интервалом. "До / после" смешано со временем (враги, карта и твоя
+        -- игра меняются вместе со сменой) - это указано явно; сравнение без этого смещения - /eclipse replay (OPE)
+        d.method, d.diff, d.ci = "before/after (confounded by time)", m - d.pre_m, 1.96 * U.sqrt(U.max(v + d.pre_v, 0))
         local verdict
         if pb >= C().p then verdict = "better" elseif pb <= 1 - C().p then verdict = "worse" elseif n >= C().max_n then verdict = "same" end
         if not verdict then return end
@@ -1585,11 +1609,25 @@ do
         for _, d in ipairs(DL.log) do
             out[#out + 1] = { kind = d.kind, key = tostring(d.key), lf = d.lf, lt = d.lt, why = d.why, verdict = d.verdict, conf = d.conf,
                 pre_m = d.pre_m and U.round(d.pre_m * 1000) / 1000, post_m = d.post_m and U.round(d.post_m * 1000) / 1000,
-                pb = d.pb and U.round(d.pb * 1000) / 1000, n = d.post_n and U.round(d.post_n * 10) / 10 or d.n, rolled = d.rolled, t = d.t, v = d.v, pre_src = d.pre_src }
+                pb = d.pb and U.round(d.pb * 1000) / 1000, n = d.post_n and U.round(d.post_n * 10) / 10 or d.n, rolled = d.rolled, t = d.t, v = d.v, pre_src = d.pre_src,
+                diff = d.diff and U.round(d.diff * 1000) / 1000, ci = d.ci and U.round(d.ci * 1000) / 1000, method = d.method }
         end
         RAP.store.set(KEY, { list = out })
     end)
     RAP.cmd.decisions = function(arg)
+        -- v60: /eclipse decisions log [n] - все решения (и эксперименты) с вероятностью выбора и причиной
+        local lg = tostring(arg or ""):match("^log%s*(%d*)")
+        if lg then
+            local L, n2 = RAP.learn, tonumber(lg) or 20
+            for k = n2 - 1, 0, -1 do
+                local d2 = L.dec[(L.dec_n - k - 1) % 300 + 1]
+                if d2 and d2.id then
+                    print(string.format("[decisions] #%-5d %-5s %-22s chose %-3s of %d  p %.2f  %-26s%s", d2.id, d2.sys, tostring(d2.key):sub(1, 22), tostring(d2.ch),
+                        d2.n, d2.p, tostring(d2.why):sub(1, 26), d2.verify and "  [verified]" or ""))
+                end
+            end
+            return
+        end
         local n = tonumber(arg) or 15
         for _, d in pairs(DL.open) do
             local m, _, ni = beta(d.h, d.m, d.w2)
@@ -1600,7 +1638,8 @@ do
             local d = DL.log[i]
             print(string.format("[decisions] %-11s %-6s %-26s %s -> %s  (%s)%s%s", d.verdict:upper() .. (d.rolled and "+RB" or ""), d.kind,
                 tostring(d.key):sub(1, 26), tostring(d.lf), tostring(d.lt), tostring(d.why),
-                d.post_m and string.format("  after %.0f%% vs %.0f%%", d.post_m * 100, (d.pre_m or 0) * 100) or "",
+                d.post_m and string.format("  after %.0f%% vs %.0f%% (diff %+.0f +/-%.0f, ess %.1f, %s)", d.post_m * 100, (d.pre_m or 0) * 100,
+                    (d.diff or (d.post_m - (d.pre_m or 0))) * 100, (d.ci or 0) * 100, d.post_n or d.n or 0, d.method or "before/after") or "",
                 d.conf and string.format("  conf %.0f%%", d.conf * 100) or ""))
         end
         if #DL.log == 0 and not next(DL.open) then print("[decisions] no decisions yet") end
@@ -1961,7 +2000,10 @@ do
         local t = {}
         -- w2: сумма квадратов весов (для эффективного объема выборки, см. RAP.dl.n_info)
         -- vh / vm / vw2 (v58): награда "доля HP цели, снятая выстрелом" (убийство = 1, промах = 0) как дробные успехи
-        for a = 1, #ARMS do t[a] = { h = 0, m = 0, w2 = 0, att = 0, hits = 0, hh = 0, bh = 0, corr = 0, mis = 0, pe = 0, vh = 0, vm = 0, vw2 = 0 } end
+        -- lh / lm / lw2 (v60): ЗАМОРОЖЕННЫЕ счетчики попаданий до v60 - приор старого опыта. Новые выстрелы идут только в
+        -- vh / vm (h / m копятся дальше лишь для отображения): иначе каждый выстрел считался дважды (vh и h) - ESS x1.25
+        for a = 1, #ARMS do t[a] = { h = 0, m = 0, w2 = 0, att = 0, hits = 0, hh = 0, bh = 0, corr = 0, mis = 0, pe = 0, vh = 0, vm = 0, vw2 = 0,
+            lh = 0, lm = 0, lw2 = 0 } end
         return t
     end
     local function ctx_entry(key)
@@ -1973,7 +2015,7 @@ do
     end
     local function pop_entry(key)
         local p = ST.pop[key]
-        if not p then p = {}; for a = 1, #ARMS do p[a] = { h = 0, m = 0, vh = 0, vm = 0 } end; ST.pop[key] = p end
+        if not p then p = {}; for a = 1, #ARMS do p[a] = { h = 0, m = 0, vh = 0, vm = 0, lh = 0, lm = 0 } end; ST.pop[key] = p end
         return p
     end
 
@@ -1986,7 +2028,11 @@ do
                     local ne = { arms = new_arms(), ts = tonumber(e.ts) or 0, dts = U.num(e.dts, 0) }
                     for a = 1, #ARMS do
                         local x = e.arms[a] or e.arms[tostring(a)]
-                        if type(x) == "table" then for f in pairs(ne.arms[a]) do ne.arms[a][f] = U.num(x[f], 0, 1e5) or 0 end end
+                        if type(x) == "table" then
+                            for f in pairs(ne.arms[a]) do ne.arms[a][f] = U.num(x[f], 0, 1e5) or 0 end
+                            -- миграция v59 -> v60: старые h / m становятся замороженным приором (один раз)
+                            if x.lh == nil then local y = ne.arms[a]; y.lh, y.lm, y.lw2 = y.h, y.m, y.w2; RAP.store.mark(KEY) end
+                        end
                     end
                     ST.ctx[k] = ne
                 end
@@ -2000,6 +2046,8 @@ do
                             if type(x) == "table" then
                                 np[a].h, np[a].m = U.num(x.h, 0, 1e5) or 0, U.num(x.m, 0, 1e5) or 0
                                 np[a].vh, np[a].vm = U.num(x.vh, 0, 1e5) or 0, U.num(x.vm, 0, 1e5) or 0
+                                np[a].lh, np[a].lm = U.num(x.lh, 0, 1e5), U.num(x.lm, 0, 1e5)
+                                if np[a].lh == nil then np[a].lh, np[a].lm = np[a].h, np[a].m end
                             end
                         end
                     end
@@ -2016,7 +2064,11 @@ do
                     local age = now - U.max(e.ts or now, e.dts or 0)
                     if age > 3600 then
                         local w = 0.5 ^ (age / hl)
-                        for a = 1, #ARMS do local x = e.arms[a]; x.h, x.m, x.w2 = x.h * w, x.m * w, x.w2 * w * w end
+                        for a = 1, #ARMS do
+                            local x = e.arms[a]
+                            x.h, x.m, x.w2, x.vh, x.vm, x.vw2 = x.h * w, x.m * w, x.w2 * w * w, x.vh * w, x.vm * w, x.vw2 * w * w
+                            x.lh, x.lm, x.lw2 = x.lh * w, x.lm * w, x.lw2 * w * w
+                        end
                         e.dts = now
                         RAP.store.mark(KEY)
                     end
@@ -2075,7 +2127,7 @@ do
             local P = ST.pop[wg .. "|" .. aat] or ST.pop[wg] or ST.pop.any
             if P then
                 local q = P[a]
-                local pr = ((q.vh or 0) + K * q.h + 1) / ((q.vh or 0) + (q.vm or 0) + K * (q.h + q.m) + 2)
+                local pr = ((q.vh or 0) + K * (q.lh or 0) + 1) / ((q.vh or 0) + (q.vm or 0) + K * ((q.lh or 0) + (q.lm or 0)) + 2)
                 ph, pm = pr * c.prior_weight, (1 - pr) * c.prior_weight
             end
         end
@@ -2086,27 +2138,28 @@ do
         -- v58: оценка = ожидаемая доля HP цели за выстрел (урон / убийство), а не доля попаданий: тело - большая
         -- цель, и по hit rate модель по построению уходила в тело / safe point даже там, где голова убивает быстрее.
         -- Старые h / m (попадания) остаются слабым приором с весом K - накопленный опыт не теряется.
-        local al, be = 1 + ph + (x.vh or 0) + K * x.h + sh, 1 + pm + (x.vm or 0) + K * x.m + sm
+        local al, be = 1 + ph + (x.vh or 0) + K * (x.lh or 0) + sh, 1 + pm + (x.vm or 0) + K * (x.lm or 0) + sm
         local mean = al / (al + be)
         -- Неопределенность - только по уникальной информации: выстрелы сессии уже входят в x (их доп. вес меняет
         -- среднее, но не добавляет данных). Раньше дисперсия считалась по завышенным счетчикам -> ложная уверенность.
         -- v51: объем данных - эффективный: min(сумма весов, n_eff). Попадания в голову весят 1.5 и раньше выглядели
         -- как больше выстрелов, чем было. Старые записи без w2 считаются выборками с единичным весом.
-        local n_x = RAP.dl.n_info((x.vh or 0) + (x.vm or 0), x.vw2) + K * RAP.dl.n_info(x.h + x.m, x.w2)
+        local n_x = RAP.dl.n_info((x.vh or 0) + (x.vm or 0), x.vw2) + K * RAP.dl.n_info((x.lh or 0) + (x.lm or 0), x.lw2)
         local n_u = 2 + ph + pm + n_x
         return mean, mean * (1 - mean) / (n_u + 1), n_x
     end
-    local function phi(z)
-        local s, x = z < 0 and -1 or 1, U.abs(z) / 1.41421356
-        local t = 1 / (1 + 0.3275911 * x)
-        local y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * math.exp(-x * x)
-        return 0.5 * (1 + s * y)
-    end
     -- уверенность: P(стратегия b лучше a)
+    -- v60: единая уверенность (RAP.learn.p_better) с поправкой калибровки стратегий
     function ST.p_better(key, b, a, wg, aat)
         local mb, vb = ST.post(key, b, wg, aat)
         local ma, va = ST.post(key, a, wg, aat)
-        return phi((mb - ma) / U.sqrt(U.max(vb + va, 1e-6)))
+        return RAP.learn.p_better(mb, vb, ma, va, "st")
+    end
+    -- собственный эффективный объем данных стратегии по этой цели (без приоров популяции и старых счетчиков)
+    function ST.own_ess(key, a)
+        local e = ST.ctx[key]
+        local x = e and e.arms[a]
+        return x and RAP.dl.n_info((x.vh or 0) + (x.vm or 0), x.vw2) or 0
     end
     -- Гистерезис с учетом неопределенности (общий принцип для стратегий и AA-профилей, см. RAP.switch_ok):
     -- переключиться можно, только если P(новая лучше) >= порога И разница оценок больше max(margin, 1 sd разницы).
@@ -2117,6 +2170,10 @@ do
         return p_better >= p_need and gap >= need, gap, need
     end
     function ST.should_switch(t, alt)
+        -- v60: "prior only" не бывает уверенным - уверенная смена требует СОБСТВЕННЫХ данных по обоим вариантам
+        -- (новые стратегии пробуются экспериментом / panic, а не "по приору популяции")
+        local need = RAP.CFG.learn.min_ess
+        if ST.own_ess(t.key, alt) < need or ST.own_ess(t.key, t.arm) < need then return false end
         local ma, va = ST.post(t.key, alt, t.wg, t.aat)
         local mc, vc = ST.post(t.key, t.arm, t.wg, t.aat)
         return (RAP.switch_ok(ma, va, mc, vc, ST.p_better(t.key, alt, t.arm, t.wg, t.aat), C().confidence, C().equal_margin))
@@ -2172,7 +2229,7 @@ do
         if t.state == "RELEARNING" and t.relearn > 0 then  -- RELEARNING держится, пока не сделаны relearn_shots выстрелов
             t.state = "RELEARNING"
         elseif t.samples < 0.5 then t.state = "UNKNOWN"
-        elseif not beaten and t.pconf >= c.confident_p and t.n >= c.min_samples then t.state = "CONFIDENT"
+        elseif not beaten and t.pconf >= c.confident_p and t.n >= c.min_samples and ST.own_ess(t.key, t.arm) >= RAP.CFG.learn.min_ess then t.state = "CONFIDENT"
         elseif t.state ~= "FAILED" then t.state = "PROBING" end
         -- что произойдет дальше
         if t.state == "CONFIDENT" then t.next = string.format("keep %s (fails after %d misses in a row)", ARMS[t.arm], c.panic_misses - t.streak)
@@ -2333,6 +2390,10 @@ do
             p = rec.ctx.p or 1, pred = rec.ctx.conf, grp = rec.grp, why = rec.ctx.attr_why }
         rec.sample = smp
         rec.ctx.val = y
+        if RAP.CONF and RAP.CONF.shot then
+            local cs = RAP.CONF.shot
+            cs.sid, cs.did, cs.p, cs.y, cs.b = smp.sid, smp.did, smp.p, smp.y, smp.b
+        end
         if w > 0 and smp.pred then L.calib_add("st", smp.pred, y, w) end
         L.mark()
         -- обнаружение изменения поведения врага: преимущество наших выстрелов по нему резко упало -> RELEARNING
@@ -2367,7 +2428,11 @@ do
         local c = C()
         local en = ctx_entry(key)
         local dk = c.decay ^ cw
-        for a = 1, #ARMS do local x = en.arms[a]; x.h, x.m, x.vh, x.vm, x.vw2 = x.h * dk, x.m * dk, (x.vh or 0) * dk, (x.vm or 0) * dk, (x.vw2 or 0) * dk * dk end
+        for a = 1, #ARMS do
+            local x = en.arms[a]
+            x.h, x.m, x.vh, x.vm, x.vw2 = x.h * dk, x.m * dk, (x.vh or 0) * dk, (x.vm or 0) * dk, (x.vw2 or 0) * dk * dk
+            x.lh, x.lm, x.lw2 = (x.lh or 0) * dk, (x.lm or 0) * dk, (x.lw2 or 0) * dk * dk
+        end
         local x = en.arms[arm]
         -- v58: награда = доля HP цели, снятая выстрелом: min(урон, HP до выстрела) / HP до выстрела; убийство = 1,
         -- промах = 0. Голова в HvH чаще убивает одним выстрелом - модель видит это напрямую, а не через вес 1.5.
@@ -2477,6 +2542,7 @@ do
                 local x = e.arms[a]
                 x.h, x.m, x.w2 = U.round(x.h * 1000) / 1000, U.round(x.m * 1000) / 1000, U.round(x.w2 * 1000) / 1000
                 x.vh, x.vm, x.vw2 = U.round((x.vh or 0) * 1000) / 1000, U.round((x.vm or 0) * 1000) / 1000, U.round((x.vw2 or 0) * 1000) / 1000
+                x.lh, x.lm, x.lw2 = U.round((x.lh or 0) * 1000) / 1000, U.round((x.lm or 0) * 1000) / 1000, U.round((x.lw2 or 0) * 1000) / 1000
             end
         end
         for pid, v in pairs(ST.corr) do
@@ -4022,7 +4088,7 @@ do
             grp = rec.grp, why = table.concat(why, ", "), fine = fine, mq = rec.mq }
         rec.sample = smp
         RAP.CONF = RAP.CONF or {}
-        RAP.CONF.eshot = { w = aw, why = smp.why, r = kind, t = globals.realtime }
+        RAP.CONF.eshot = { w = aw, why = smp.why, r = kind, t = globals.realtime, sid = smp.sid, p = smp.p, b = smp.b, adv = smp.adv }
         if w > 0 and pred then L.calib_add("aa", pred, y, w) end
         L.mark()
         if RAP.tele and RAP.tele.apush then
@@ -4655,7 +4721,7 @@ do
         if c.st then
             local t, ST = c.st, RAP.strat
             -- v59: при малом числе своих выстрелов уверенность берется из приора (популяция) - так и пишется
-            local prior_only = (c.samples or 0) < (RAP.CFG.strategy.min_samples or 2)
+            local prior_only = RAP.strat.own_ess(c.st.key, c.st.arm) < RAP.CFG.learn.min_ess
             print(string.format("[why]  strategy: %s, %s, confidence %s (%s), %.0f samples%s", c.arm, c.state or "-", pc(c.strategy),
                 prior_only and "prior only - not enough own shots" or RAP.conf_level(c.strategy), c.samples, prior_only and " [estimate from other enemies]" or ""))
             print(string.format("[why]    why: %s | next: %s", tostring(c.why or "-"), tostring(c.next or "-")))
@@ -4673,8 +4739,9 @@ do
         end
         if c.profile then
             local AI = RAP.ai
-            print(string.format("[why]  your AA [%s]: %s (%s, %.0f s), dodge estimate %s over %.1f events, best-vs-2nd %s (%s), explore %s",
-                c.group, c.profile, c.how or "-", U.min(999, c.age or 0), pc(c.dodge), c.events, pc(c.aa_conf), c.aa_mode or "-", pc(c.explore)))
+            print(string.format("[why]  your AA [%s]: %s (%s, %.0f s), dodge estimate %s over %.1f own effective samples%s, best-vs-2nd %s (%s), explore %s",
+                c.group, c.profile, c.how or "-", U.min(999, c.age or 0), pc(c.dodge), c.events,
+                c.events < RAP.CFG.learn.min_ess and " [prior only]" or "", pc(c.aa_conf), c.aa_mode or "-", pc(c.explore)))
             local rej = {}
             for _, i in ipairs(AI.pool(c.group)) do
                 if i ~= c.pidx then local m, _, n = AI.post(c.group, i, c.pid); rej[#rej + 1] = { RAP.profiles.list[i].name, m, n } end
@@ -4695,8 +4762,11 @@ do
             print("[why]    overrides on top of the profile: " .. (#ov > 0 and table.concat(ov, ", ") or "none"))
         end
         print("[why]  head policy (" .. tostring(RAP.v("rage.head")) .. "): " .. tostring(RAP.ragev and RAP.ragev.head_why or "-"))
-        if c.shot then print(string.format("[why]  your last shot: %s, learning weight %.2f (%s)", c.shot.r, c.shot.w, c.shot.why)) end
-        if c.eshot then print(string.format("[why]  last enemy shot at you: %s, learning weight %.2f (%s)", c.eshot.r, c.eshot.w, c.eshot.why)) end
+        if c.shot then print(string.format("[why]  your last shot: %s, learning weight %.2f (%s)%s", c.shot.r, c.shot.w, c.shot.why,
+            c.shot.sid and string.format(" | shot #%d, decision #%s p %.2f, value %.2f vs baseline %.2f (adv %+.2f)", c.shot.sid, tostring(c.shot.did or "-"),
+                c.shot.p or 1, c.shot.y or 0, c.shot.b or 0, (c.shot.y or 0) - (c.shot.b or 0)) or "")) end
+        if c.eshot then print(string.format("[why]  last enemy shot at you: %s, learning weight %.2f (%s)%s", c.eshot.r, c.eshot.w, c.eshot.why,
+            c.eshot.sid and string.format(" | shot #%d, p %.2f, dodge baseline %.2f (adv %+.2f)", c.eshot.sid, c.eshot.p or 1, c.eshot.b or 0, c.eshot.adv or 0) or "")) end
         print(string.format("[why]  overall decision confidence: %s (%s) - the weakest link of the chain", pc(c.overall), RAP.conf_level(c.overall)))
     end
     RAP.on("panel_rows", "confidence", function(rows)

@@ -10,9 +10,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y luajit luarocks lua-cjson
           sudo luarocks install luacheck
-      - name: Syntax (luajit -bl)
-        run: luajit -bl eclipse.lua > /dev/null
-      - name: luacheck
-        run: luacheck .
-      - name: Offline logic tests (stubbed Neverlose API)
-        run: luajit tests/run.lua
+      - name: Syntax + luacheck + offline tests (tests/run.sh)
+        run: ./tests/run.sh

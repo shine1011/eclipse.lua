@@ -679,6 +679,60 @@ test("sim: change detection fires within 30 shots after a behaviour change and r
     assert(delays[math.floor(#delays * 0.9)] <= 30, "90% detection delay " .. delays[math.floor(#delays * 0.9)])
 end)
 
+test("learn: 'prior only' never switches confidently and never becomes CONFIDENT", function()
+    local E = S.load(PATH)
+    local ST = E.RAP.strat
+    local key = "x:70|Auto|jitter"
+    -- сильный приор популяции за стратегию 6, собственных данных нет
+    ST.pop["Auto|jitter"] = {}
+    for a = 1, 8 do ST.pop["Auto|jitter"][a] = { h = 0, m = 0, vh = a == 6 and 50 or 5, vm = a == 6 and 5 or 50, lh = 0, lm = 0 } end
+    local t = { key = key, wg = "Auto", aat = "jitter", arm = 1, n = 5, streak = 0, state = "PROBING", relearn = 0, idx = 70 }
+    assert(ST.post(key, 6, "Auto", "jitter") > ST.post(key, 1, "Auto", "jitter") + 0.2, "setup: prior should strongly prefer arm 6")
+    assert(ST.should_switch(t, 6) == false, "switched on prior only")
+    ST.evaluate(t)
+    assert(t.state ~= "CONFIDENT", "prior-only state became CONFIDENT")
+    assert(E.RAP.learn.level(0.99, 0) == "prior only")
+end)
+
+test("migration: a v59 database loads, old hit counts become the frozen prior, schema 60, everything saves", function()
+    local E = S.load(PATH)
+    -- снимок базы v59 (форма данных v59: arms без lh / lm, rap2_ai без adv, журналы без полей выборки)
+    local v59 = {
+        rap2_meta = json.stringify({ schema = 50, version = "2.0 beta (v59)" }),
+        rap2_strat = json.stringify({ ctx = { ["x:1|Auto|jitter"] = { ts = 1759000000, arms = {
+            { h = 6, m = 4, w2 = 10, att = 10, hits = 6, hh = 2, bh = 4, corr = 2, mis = 1, pe = 1, vh = 3, vm = 7, vw2 = 10 } } } },
+            pop = { ["Auto|jitter"] = { { h = 20, m = 10, vh = 8, vm = 22 } } }, corr = { ["x:1"] = 2 } }),
+        rap2_ai = json.stringify({ st = {}, bd = { stand = { ["9"] = { 5, 3 } } }, ets = {} }),
+        rap2_journal = json.stringify({ rows = { { v = "2.0 beta (v59)", w = "Auto", s = "Default", r = "hit", d = 50 } } }),
+    }
+    local F = S.env()
+    for k, v in pairs(v59) do F.DB[k] = v end
+    _G.print = function() end
+    local f = assert(io.open(PATH, "rb")); local src = f:read("*a"); f:close()
+    local RAP = assert(loadstring(src .. "\nreturn RAP", "=eclipse"))()
+    E.restore_print()
+    local x = RAP.strat.ctx["x:1|Auto|jitter"].arms[1]
+    assert(x.lh == 6 and x.lm == 4 and x.vh == 3, "old h/m not frozen into lh/lm")
+    assert(RAP.strat.pop["Auto|jitter"][1].lh == 20, "population prior not migrated")
+    assert(json.parse(F.DB.rap2_meta).schema == 60, "schema not bumped")
+    RAP.save_all(true)
+    local d = json.parse(F.DB.rap2_strat)
+    assert(d.ctx["x:1|Auto|jitter"].arms[1].lh == 6, "frozen prior not saved")
+    assert(F.DB.rap2_learn ~= nil, "rap2_learn not written")
+    for k, v in pairs(F.DB) do assert(#v < 768 * 1024, k .. " over the limit") end
+    for k, e in pairs(RAP.U.errors) do error("module error " .. k .. ": " .. tostring(e.msg)) end
+end)
+
+test("learn: console commands calib / replay / decisions log run on mixed old and new rows", function()
+    local E = S.load(PATH)
+    local RAP = E.RAP
+    RAP.tele.journal.rows = { { v = "old", r = "hit" }, { v = "2.0 beta (v60)", an = 2, pr = 0.5, o = 1, b = 0.4, aw = 1 } }
+    RAP.tele.ajournal.rows = { { p = 9, pr = 1, o = 1, b = 0.5, aw = 1, w0 = 1, dg = 1 } }
+    E.console("/eclipse calib"); E.console("/eclipse replay"); E.console("/eclipse replay legacy"); E.console("/eclipse decisions log 5")
+    assert(has_line(E, "1 skipped") and has_line(E, "DR"), "OPE output")
+    no_errors(E)
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP
