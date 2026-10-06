@@ -1369,6 +1369,9 @@ do
         end
         if #order > 0 then
             U.log("report", "by version (journal, last %d shots):", #rows)
+            -- v60: награда и обучение менялись (v58 - доля HP, v60 - преимущество / пропенсити) - hit rate версий сравним,
+            -- но выбор стратегий разными версиями сделан по разным критериям
+            if #order > 1 then U.log("report", "  note: v58 changed the strategy reward (HP share), v60 the learning pipeline - compare hit rates, not decisions") end
             for _, v in ipairs(order) do
                 local b = byv[v]
                 local rt = "-"
@@ -2380,7 +2383,8 @@ do
         local tc = rec.idx and RAP.TC[rec.idx]
         local tmove = tc and ((tc.move.speed or 0) < 5 and "st" or "mv") or "?"
         local wg = rec.ctx.wg or rec.wgroup or "?"
-        local fine = wg .. "|" .. tmove .. "|" .. tostring(rec.ctx.aatk or rec.ctx.aat or "?") .. "|" .. dband(tc and tc.geo.dist)
+        -- выстрелы в цикле ideal tick (DT + пик + телепорт) - отдельный контекст базовой линии
+        local fine = wg .. "|" .. tmove .. "|" .. tostring(rec.ctx.aatk or rec.ctx.aat or "?") .. "|" .. dband(tc and tc.geo.dist) .. (rec.itc and "|it" or "")
         local coarse = wg .. "|" .. tmove
         local b = L.base_get("st", fine, coarse)
         L.base_add("st", fine, coarse, y, 1)
@@ -2518,6 +2522,39 @@ do
             end
         end
         return false
+    end
+    -- v60: /eclipse attr - насколько причина промаха зависит от выбранной стратегии (по журналу с v60). Для причины r:
+    -- доля r по стратегиям; F = разброс долей между стратегиями / биномиальный шум. F ~ 1 - причина от стратегии не
+    -- зависит (ее вес атрибуции должен быть низким), F >> 1 - зависит. Устойчивость - F на первой и второй половине.
+    RAP.cmd.attr = function()
+        local rows = {}
+        for _, r in ipairs(RAP.tele.journal.rows) do if r.an and r.pr then rows[#rows + 1] = r end end
+        if #rows < 40 then print(string.format("[attr] %d v60+ shots in the journal - need 40+ for a measurement", #rows)); return end
+        local function fstat(list, reason)
+            local by, n, k = {}, 0, 0
+            for _, r in ipairs(list) do
+                local b = by[r.an]; if not b then b = { n = 0, k = 0 }; by[r.an] = b end
+                b.n = b.n + 1; n = n + 1
+                if r.r == reason then b.k = b.k + 1; k = k + 1 end
+            end
+            local p0 = k / U.max(1, n)
+            local num, df = 0, 0
+            for _, b in pairs(by) do if b.n >= 5 then num = num + b.n * (b.k / b.n - p0) ^ 2; df = df + 1 end end
+            if df < 2 or p0 <= 0 or p0 >= 1 then return nil, p0 end
+            return (num / (df - 1)) / (p0 * (1 - p0)), p0
+        end
+        local half = math.floor(#rows / 2)
+        local h1, h2 = {}, {}
+        for i, r in ipairs(rows) do if i <= half then h1[#h1 + 1] = r else h2[#h2 + 1] = r end end
+        print(string.format("[attr] %d shots with logged decisions; F ~ 1: reason does not depend on the strategy, F > 2-3: it does", #rows))
+        for _, reason in ipairs({ "correction", "misprediction", "prediction error", "spread", "backtrack failure", "damage rejection" }) do
+            local f, p0 = fstat(rows, reason)
+            local f1, f2 = fstat(h1, reason), fstat(h2, reason)
+            local key = ATTR_KEY[reason]
+            print(string.format("[attr]   %-18s rate %4.0f%%  F %s  (halves %s / %s)  current weight %s", reason, p0 * 100,
+                f and string.format("%.1f", f) or "-", f1 and string.format("%.1f", f1) or "-", f2 and string.format("%.1f", f2) or "-",
+                key and tostring(RAP.CFG.attr[key]) or "0 (not learned)"))
+        end
     end
     RAP.on("level", "strategy", function() ST.T, ST.sess = {}, {} end)
     RAP.resets.strategy = function() ST.ctx, ST.pop, ST.corr, ST.sess, ST.T = {}, {}, {}, {}, {} end
@@ -6852,7 +6889,8 @@ do
         print("[eclipse] " .. RAP.VERSION .. " - console commands (/eclipse <command>):")
         print("[eclipse]   selftest [release]  health  perf [sec]  why  strat  ai  evo  evolve  decisions [n]  journal [n]")
         print("[eclipse]   report  coach  deaths  shots  peek  replay [aa | strategy.x=v ...]  cfg [path value | reset]")
-        print("[eclipse]   db [reset <part>]  save  reset_ai  it (ideal tick cycles)")
+        print("[eclipse]   db [reset <part>]  save  reset_ai  it (ideal tick cycles)  stalls")
+        print("[eclipse]   calib  attr  decisions log [n]  replay [aa | strat | legacy ...]")
     end
     C.brain = function() RAP.cmd.strat() end
     C.cfg = function(arg)
