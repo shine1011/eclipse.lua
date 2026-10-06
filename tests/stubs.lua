@@ -63,9 +63,13 @@ function M.env()
                 local last = select(select("#", ...), ...)
                 local list
                 if last == "Safe Points" or last == "Body Aim" then list = { "Default", "Prefer", "Force" } end
-                E.found[key] = item(last, 50, list)
+                local def = 50
+                if last == "Delay Shot" or last == "Enabled" then def = true end
+                local h = E.find_hook and E.find_hook(key, last)
+                if h == nil then h = item(last, def, list) end
+                E.found[key] = h
             end
-            return E.found[key]
+            return E.found[key] or nil
         end,
         get_binds = function() return {} end, get_alpha = function() return 0 end, get_style = function() return nil end,
         get_mouse_position = function() return vec() end, get_position = function() return vec() end, get_size = function() return vec() end,
@@ -111,8 +115,9 @@ function M.env()
 end
 
 -- Загружает скрипт в свежем окружении. print скрипта собирается в E.out (печать в консоль - только при verbose).
-function M.load(path, verbose)
+function M.load(path, verbose, setup)
     local E = M.env()
+    if setup then setup(E, item) end
     E.out = {}
     local real_print = print
     _G.print = function(...)

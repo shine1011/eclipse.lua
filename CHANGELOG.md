@@ -2,6 +2,15 @@
 
 Файл скрипта: `eclipse.lua` (до v52 включительно назывался `eclipse vNN.lua`). Версия — `RAP.VERSION` в файле и тег в GitHub Releases.
 
+## v61 — 2.0 beta (срочное исправление)
+
+- **Чит переставал стрелять при включённом `Script rage control` (v58–v60).** С v58 Delay Shot ищется по всем возможным путям меню. Поиск пункта (`R.multi`) записан как `path_sub and find(путь с подпунктом) or find(родитель)`: если подпункта «Delay Shot» нет, выражение возвращало **родителя**. Путь `Main / Enabled / Delay Shot` давал сам Ragebot **Enabled**, а `Selection / Hit Chance / Delay Shot` — Hit Chance. Режим «Delay Shot: Always off» ставил им override `false`, и рагебот выключался. Это видно в `/eclipse selftest` v60: `Main / Enabled / Delay Shot (0 weapon tab(s))`.
+  - Поиск исправлен: если подпункта нет, пункт считается ненайденным.
+  - Delay Shot переопределяется только у пункта с именем «Delay Shot» и значением да / нет. Остальные кандидаты отклоняются и показываются в `/eclipse selftest` и `/eclipse stalls`.
+  - Пункты рагебота с чужим именем не переопределяются (`selftest`: «ragebot items have the expected names»).
+- **Предохранитель.** Если цель видна, оружие готово, а выстрела нет 32 тика (0.5 с), скрипт снимает **все** свои переопределения рагебота, включая Delay Shot и min damage, до следующего выстрела. На прицеле — `PRESSURE: ALL RELEASED`, в `/eclipse stalls` — счётчик `full releases`.
+- Офлайн-тестов: 41. Оба новых теста падают на v60 с той же ошибкой, что была в игре.
+
 ## v60 — 2.0 beta
 
 Новых функций нет: только причинность обучения. Разбор — в `AUDIT_v59_causality.md`. Поведение Ideal tick, политики головы, давления выстрелов и AA не менялось; изменилось только то, **как** скрипт учится на исходах.

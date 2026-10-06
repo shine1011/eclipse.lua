@@ -394,6 +394,62 @@ test("shot pressure: tick-based levels, stall log with causes, Delay Shot off on
     no_errors(E)
 end)
 
+test("Delay Shot: a path that resolves to another item (Ragebot Enabled, Hit Chance) is never overridden; 0.5 s without a shot releases everything", function()
+    -- так было в игре (v58-v60): ui.find("... Main / Enabled / Delay Shot") вернул сам Ragebot Enabled -> override false
+    local enabled, hc
+    local E = S.load(PATH, false, function(E0, item)
+        enabled, hc = item("Enabled", true), item("Hit Chance", 50)
+        E0.find_hook = function(key)
+            if key == "Aimbot/Ragebot/Main/Enabled/Delay Shot" then return enabled end
+            if key == "Aimbot/Ragebot/Selection/Hit Chance/Delay Shot" then return hc end
+            if key:find("Delay Shot") then return false end   -- как в игре: остальные пути не находятся
+        end
+    end)
+    local RAP = E.RAP
+    local wpn = { m_flNextPrimaryAttack = 0, m_iClip1 = 5, get_weapon_index = function() return 7 end }
+    local me = S.player({ idx = 1, m_flNextAttack = 0, get_player_weapon = function() return wpn end,
+        get_eye_position = function() return vec(0, 0, 64) end, get_origin = function() return vec() end })
+    local enemy = S.player({ idx = 3, is_visible = function() return true end, get_origin = function() return vec(500, 0, 0) end })
+    entity.get_local_player = function() return me end
+    entity.get_players = function(_, _, cb) cb(enemy) end
+    entity.get_threat = function() return enemy end
+    RAP.cfg["rage.dmg_on"]:set(true); RAP.cfg["rage.dmg_key"]:set(true)
+    local function tick() E.T.tick = E.T.tick + 1; E.T.now = E.T.now + 1 / 64; E.fire("createmove", { choked_commands = 0, view_angles = vec() }) end
+    for _ = 1, 10 do tick() end
+    assert(enabled.ov == nil, "Ragebot Enabled overridden: " .. tostring(enabled.ov))
+    assert(hc.ov == nil, "Hit Chance overridden through the Delay Shot path: " .. tostring(hc.ov))
+    assert(#RAP.ref.delay_shot_rejected == 2, "rejected candidates: " .. table.concat(RAP.ref.delay_shot_rejected, "; "))
+    local md = RAP.ref.rage.min_damage.all[1]
+    assert(md.ov ~= nil, "damage key vote not applied before the stall")
+    for _ = 1, 30 do tick() end
+    assert(RAP.pressure.level == 3, "no full release after 32 ticks: " .. RAP.pressure.level)
+    assert(md.ov == nil, "min damage still overridden at full release")
+    assert(RAP.ref.delay_shot == nil and enabled.ov == nil and hc.ov == nil)
+    E.fire("aim_fire", { id = 1, target = enemy, damage = 50 })
+    assert(RAP.pressure.level == 0)
+    E.console("/eclipse selftest"); E.console("/eclipse stalls")
+    assert(has_line(E, "rejected Delay Shot candidates") and has_line(E, "1 full releases"), "selftest / stalls output")
+    no_errors(E)
+end)
+
+test("Delay Shot missing in the build: the parent item (Ragebot Enabled / Hit Chance) is never taken instead (v58-v60 bug)", function()
+    local E = S.load(PATH, false, function(E0)
+        E0.find_hook = function(key) if key:find("Delay Shot") then return false end end
+    end)
+    local RAP = E.RAP
+    assert(RAP.ref.delay_shot == nil, "Delay Shot 'found' although no such item exists")
+    local wpn = { m_flNextPrimaryAttack = 0, m_iClip1 = 5, get_weapon_index = function() return 7 end }
+    local me = S.player({ idx = 1, m_flNextAttack = 0, get_player_weapon = function() return wpn end,
+        get_eye_position = function() return vec(0, 0, 64) end, get_origin = function() return vec() end })
+    entity.get_local_player = function() return me end
+    for _ = 1, 5 do E.T.tick = E.T.tick + 1; E.fire("createmove", { choked_commands = 0, view_angles = vec() }) end
+    for _, key in ipairs({ "Aimbot/Ragebot/Main/Enabled", "Aimbot/Ragebot/Selection/Hit Chance", "Aimbot/Ragebot/Accuracy/Hit Chance" }) do
+        local it = E.found[key]
+        assert(not it or it.ov == nil, key .. " overridden: " .. tostring(it and it.ov))
+    end
+    no_errors(E)
+end)
+
 local function rage_scene(widx, enemy_fields)
     local E = S.load(PATH)
     local RAP = E.RAP

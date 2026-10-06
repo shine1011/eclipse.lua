@@ -1,5 +1,5 @@
 --[[
-    ECLIPSE (2.0 beta, v60) — скрипт для Neverlose (CS:GO legacy). Ранее назывался Rage AA Pro 2.
+    ECLIPSE (2.0 beta, v61) — скрипт для Neverlose (CS:GO legacy). Ранее назывался Rage AA Pro 2.
     Внутренние имена (таблица RAP, ключи базы rap2_*) сохранены: так переносится все накопленное обучение.
     Модули: core / api (пункты чита, арбитр) / menu / world / shots / telemetry / rage (classifier, brain, resolver,
     голосование) / AA (refs, профили, меню, движок, AI, эволюция) / visuals / lag / exploits / dormant / AI peek /
@@ -10,7 +10,7 @@
     Ни один модуль не вызывает override напрямую для рагебот-пунктов: только RAP.vote(). Это убирает "войну"
     переопределений, а /eclipse why показывает, кто какое решение принял.
 ]]
-local RAP = { NAME = "ECLIPSE", VERSION = "2.0 beta (v60)", mods = {}, tick = {}, frame = {}, hooks = {}, cmd = {}, resets = {} }
+local RAP = { NAME = "ECLIPSE", VERSION = "2.0 beta (v61)", mods = {}, tick = {}, frame = {}, hooks = {}, cmd = {}, resets = {} }
 
 ---------------------------------------------------------------- util
 do
@@ -190,6 +190,9 @@ do
             rollback = 1,          -- 1 = откатывать смены с вердиктом "хуже", 0 = только записывать
         },
         shots = { near = 60, inacc_drop = 0.4 },
+        -- v61: столько тиков "цель видна + оружие готово + выстрела нет" -> снимаются ВСЕ переопределения рагебота
+        -- скрипта (и Delay Shot, и min damage) до следующего выстрела: скрипт не может держать рагебот без выстрелов
+        pressure = { t3 = 32 },
         peek = { scan_ms = 1.5 },
         aa_ai = { explore_far = 1500, peek_speed = 100,
             safe_head_dz = 45 },  -- v59: safe head только при реальном перепаде высоты (было 22 - ступенька / ящик)   -- v58: эксперимент / Evo-испытание только против врага дальше этого и когда ты не пикаешь        -- AI Peek: время скана за тик (мс), остаток направлений - на следующих тиках
@@ -314,12 +317,21 @@ do
 end
 ---------------------------------------------------------------- refs: пункты меню чита
 do
-    local R = { missing = {} }
+    local R = { missing = {}, misnamed = {} }
     local function find(...)
         local ok, it = pcall(ui.find, ...)
         return ok and it or nil
     end
     R.find = find
+    -- v61: ui.find в некоторых сборках возвращает РОДИТЕЛЬСКИЙ пункт, если последнего элемента пути нет (поиск
+    -- "Main / Enabled / Delay Shot" отдавал сам Ragebot Enabled - override false выключал рагебот целиком).
+    -- named(it, want): true - имя пункта совпадает с последним элементом пути, false - не совпадает, nil - имя не читается
+    local function named(it, want)
+        local ok, nm = pcall(it.name, it)
+        if not ok or type(nm) ~= "string" or nm == "" then return nil end
+        return nm:lower():gsub("^%s+", ""):gsub("%s+$", "") == want:lower()
+    end
+    R.named = named
     R.WSUB = { "Global", "SSG-08", "AWP", "AutoSnipers", "Desert Eagle", "R8 Revolver", "Pistols", "SMGs", "Rifles",
         "Shotguns", "Machineguns" }
     R.WIDX_SUB = { [40] = "SSG-08", [9] = "AWP", [11] = "AutoSnipers", [38] = "AutoSnipers", [1] = "Desert Eagle",
@@ -338,8 +350,22 @@ do
             else it = find("Aimbot", "Ragebot", path_group, w, path_item) end
             if it then items[w], n = it, n + 1 end
         end
-        local base = path_sub and find("Aimbot", "Ragebot", path_group, path_item, path_sub)
-            or find("Aimbot", "Ragebot", path_group, path_item)
+        -- v61: БЫЛО "path_sub and find(... path_sub) or find(path_item)" - если подпункта нет, a and b or c отдавал
+        -- РОДИТЕЛЯ: "Main / Enabled / Delay Shot" -> сам Ragebot Enabled, и Delay Shot off выключал рагебот (v58-v60)
+        local base
+        if path_sub then base = find("Aimbot", "Ragebot", path_group, path_item, path_sub)
+        else base = find("Aimbot", "Ragebot", path_group, path_item) end
+        -- пункт с чужим именем (родитель вместо несуществующего пункта) не переопределяется. Отбрасываются только
+        -- явные несовпадения и только если имена вообще читаются (хотя бы один пункт совпал)
+        local want = path_sub or path_item
+        local any = base and named(base, want) == true
+        for _, it in pairs(items) do if named(it, want) == true then any = true end end
+        if any then
+            if base and named(base, want) == false then R.misnamed[#R.misnamed + 1] = want .. " (global)"; base = nil end
+            for w, it in pairs(items) do
+                if named(it, want) == false then R.misnamed[#R.misnamed + 1] = want .. " (" .. w .. ")"; items[w], n = nil, n - 1 end
+            end
+        end
         if n == 0 and not base then return nil, 0 end
         local all, seen = {}, {}
         if base then all[1], seen[base] = base, true end
@@ -2816,28 +2842,42 @@ do
     -- Delay Shot: разные сборки держат его в разных группах. v58: проверяются ВСЕ пути, override идет в объединение
     -- найденных пунктов (раньше поиск останавливался на первом: в твоей сборке нашелся только общий пункт без
     -- вкладок оружия - "0 weapon tab(s)" - и Delay Shot на вкладках оружия оставался включенным).
-    local DS, DS_PATHS, DS_TABS = nil, {}, 0
+    local DS, DS_PATHS, DS_TABS, DS_REJ = nil, {}, 0, {}
     do
         local all, seen, best_n, primary = {}, {}, -1, nil
         for _, p in ipairs({ { "Selection", "Delay Shot" }, { "Selection", "Hit Chance", "Delay Shot" }, { "Accuracy", "Delay Shot" },
             { "Main", "Delay Shot" }, { "Accuracy", "Hit Chance", "Delay Shot" }, { "Main", "Enabled", "Delay Shot" } }) do
-            local P, n = RAP.ref.multi(p[1], p[2], p[3])
+            local P = RAP.ref.multi(p[1], p[2], p[3])
             if P then
-                DS_PATHS[#DS_PATHS + 1] = string.format("%s (%d weapon tab(s))", table.concat(p, " / "), n)
-                DS_TABS = DS_TABS + n
-                for _, it in ipairs(P.all) do if not seen[it] then seen[it], all[#all + 1] = true, it end end
-                if n > best_n then best_n, primary = n, P end
+                -- v61: СТРОГО - только пункт с именем "Delay Shot" и значением да / нет. Иначе это мог быть родитель
+                -- (Ragebot Enabled, Hit Chance), и override false выключал рагебот: чит не стрелял вообще
+                local good, gn = {}, 0
+                for _, it in ipairs(P.all) do
+                    local okv, v = pcall(it.get, it)
+                    if RAP.ref.named(it, "Delay Shot") == true and okv and type(v) == "boolean" then good[#good + 1] = it
+                    else DS_REJ[#DS_REJ + 1] = table.concat(p, " / ") .. " -> " .. tostring(select(2, pcall(it.name, it))) end
+                end
+                for _, it in pairs(P.items) do
+                    for _, g in ipairs(good) do if g == it then gn = gn + 1; break end end
+                end
+                if #good > 0 then
+                    DS_PATHS[#DS_PATHS + 1] = string.format("%s (%d weapon tab(s))", table.concat(p, " / "), gn)
+                    DS_TABS = DS_TABS + gn
+                    for _, it in ipairs(good) do if not seen[it] then seen[it], all[#all + 1] = true, it end end
+                    if gn > best_n then best_n, primary = gn, P end
+                end
             end
         end
         if primary then
-            DS = { all = all, name = primary.name, items = primary.items, cur = primary.cur }
+            DS = { all = all, name = primary.name, items = primary.items,
+                cur = function() local c = primary.cur(); if seen[c] then return c end return all[1] end }
             function DS.set_override(v)
                 for _, it in ipairs(all) do if v == nil then pcall(it.override, it) else pcall(it.override, it, v) end end
             end
             function DS.get() local ok, v = pcall(function() return DS.cur():get() end); return ok and v or nil end
         end
     end
-    RAP.ref.delay_shot, RAP.ref.tabs.delay_shot, RAP.ref.delay_shot_paths = DS, DS_TABS, DS_PATHS
+    RAP.ref.delay_shot, RAP.ref.tabs.delay_shot, RAP.ref.delay_shot_paths, RAP.ref.delay_shot_rejected = DS, DS_TABS, DS_PATHS, DS_REJ
     local DS_OWN = false
 
     -- снимок причин stall: что стояло в арбитре на этом тике (до голосов самого shot pressure)
@@ -2868,6 +2908,7 @@ do
 
     RAP.on("our_fire", "pressure", function(rec)
         if SP.level > 0 then SP.relief_shots = SP.relief_shots + 1 end
+        SP.full_logged = nil
         if SP.since then rec.ctx.rt = U.round((globals.curtime - SP.since) * 1000) end
         close_stall("shot")
         SP.since, SP.level, SP.t0, SP.max_level = nil, 0, nil, 0
@@ -2877,11 +2918,12 @@ do
         -- Delay Shot (скрипт его только выключает, никогда не включает)
         if DS then
             local mode = RAP.v("rage.delay")
-            local want = W.alive and RAP.v("rage.on") and not RAP.binds.is_active(DS.name) and (mode == "Always off" or (mode == "Off only while stalling" and SP.level >= 2))
+            local want = W.alive and RAP.v("rage.on") and not RAP.binds.is_active(DS.name) and SP.level < 3
+                and (mode == "Always off" or (mode == "Off only while stalling" and SP.level >= 2))
             if want and not DS_OWN then DS.set_override(false); DS_OWN = true
             elseif not want and DS_OWN then DS.set_override(nil); DS_OWN = false end
         end
-        local function reset(outcome) if SP.cur then close_stall(outcome) end; SP.since, SP.level, SP.t0, SP.max_level = nil, 0, nil, 0 end
+        local function reset(outcome) if SP.cur then close_stall(outcome) end; SP.full_logged = nil; SP.since, SP.level, SP.t0, SP.max_level = nil, 0, nil, 0 end
         if not W.alive then reset("died"); return end
         local now, tick = globals.curtime, globals.tickcount
         local thr = W.threat
@@ -2900,7 +2942,8 @@ do
         local ticks = tick - SP.t0 + 1                  -- сколько тиков подряд "видно + готово + нет выстрела"
         local t1 = RAP.v("rage.stall_t1") or 3
         local t2 = U.max(t1 + 1, RAP.v("rage.stall_t2") or 6)
-        local lvl = ticks >= t2 and 2 or (ticks >= t1 and 1 or 0)
+        local t3 = U.max(t2 + 1, RAP.CFG.pressure.t3)
+        local lvl = ticks >= t3 and 3 or (ticks >= t2 and 2 or (ticks >= t1 and 1 or 0))
         if lvl > 0 and SP.level == 0 then SP.stalls = SP.stalls + 1; SP.cur = snapshot() end
         SP.level = lvl
         SP.max_level = U.max(SP.max_level or 0, lvl)
@@ -2914,16 +2957,26 @@ do
             if ba and ba.value == O.ba_force and not (ba.src or ""):find("lethal") then RAP.vote("body_aim", O.ba_prefer or false, 90, "shot pressure: relax") end
             RAP.vote("mp_head", false, 90, "shot pressure: relax"); RAP.vote("mp_body", false, 90, "shot pressure: relax")
             RAP.vote("hitchance", false, 90, "shot pressure: relax")
-        else
+        elseif lvl == 2 then
             for _, k in ipairs({ "safe_points", "body_aim", "mp_head", "mp_body", "hitchance", "hitboxes", "ensure_safety" }) do
                 RAP.vote(k, false, 95, "shot pressure: released")
+            end
+        else
+            -- v61: предохранитель - полсекунды без выстрела по видимой цели: рагебот целиком возвращается к твоим
+            -- настройкам (и Delay Shot выше), пока не будет выстрела. Если чит и так не стреляет - причина не в скрипте
+            for k in pairs(RAP.ref.rage) do RAP.vote(k, false, 99, "shot pressure: all released") end
+            if not SP.full_logged then
+                SP.full_logged = true
+                SP.full = (SP.full or 0) + 1
+                U.log("pressure", "no shot for %d ticks at a visible target: every script ragebot override released until a shot (/eclipse stalls)", ticks)
             end
         end
     end, 90)
     RAP.cmd.stalls = function(arg)
         local n = tonumber(arg) or 15
-        print(string.format("[stalls] %d stalls (visible + ready + no shot >= %d ticks), %d shots after relief | Delay Shot: %s",
-            SP.stalls, RAP.v("rage.stall_t1") or 3, SP.relief_shots, #DS_PATHS > 0 and table.concat(DS_PATHS, "; ") or "NOT FOUND"))
+        print(string.format("[stalls] %d stalls (visible + ready + no shot >= %d ticks), %d shots after relief, %d full releases | Delay Shot: %s",
+            SP.stalls, RAP.v("rage.stall_t1") or 3, SP.relief_shots, SP.full or 0, #DS_PATHS > 0 and table.concat(DS_PATHS, "; ") or "NOT FOUND"))
+        if #DS_REJ > 0 then print("[stalls] rejected Delay Shot candidates (wrong item, never overridden): " .. table.concat(DS_REJ, "; ")) end
         local parts = {}
         for k, c in pairs(SP.causes) do parts[#parts + 1] = { k, c } end
         table.sort(parts, function(x, y) return x[2] > y[2] end)
@@ -2942,7 +2995,7 @@ do
         if next(RAP.store.rejected) then add("DB FULL: LEARNING NOT SAVED", color(255, 110, 110), 1) end
     end)
     RAP.on("ind_rows", "pressure", function(add)
-        if SP.level > 0 then add(SP.level == 2 and "PRESSURE: RELEASED" or "PRESSURE: RELAX", color(255, 200, 120), 2) end
+        if SP.level > 0 then add(SP.level == 3 and "PRESSURE: ALL RELEASED" or (SP.level == 2 and "PRESSURE: RELEASED" or "PRESSURE: RELAX"), color(255, 200, 120), 2) end
         -- Delay Shot не найден на вкладках оружия: его override, скорее всего, не действует - видно на экране
         if RAP.v("rage.delay") ~= "Don't touch" and DS_TABS == 0 then
             add(DS and "DELAY SHOT: CHECK WEAPON TABS" or "DELAY SHOT: NOT FOUND", color(255, 150, 90), 2)
@@ -6833,6 +6886,10 @@ do
         chk("Safe Points options", R.OPT.sp_prefer ~= nil and R.OPT.sp_force ~= nil, tostring(R.OPT.sp_prefer) .. " / " .. tostring(R.OPT.sp_force))
         chk("Body Aim options", R.OPT.ba_prefer ~= nil and R.OPT.ba_force ~= nil, tostring(R.OPT.ba_prefer) .. " / " .. tostring(R.OPT.ba_force))
         print("[selftest] info    cheat Delay Shot item: " .. ((R.delay_shot_paths and #R.delay_shot_paths > 0) and table.concat(R.delay_shot_paths, "; ") or "not found (option has no effect)"))
+        if R.delay_shot_rejected and #R.delay_shot_rejected > 0 then
+            print("[selftest] info    rejected Delay Shot candidates (another item behind the path, never overridden): " .. table.concat(R.delay_shot_rejected, "; "))
+        end
+        warn("ragebot items have the expected names", #R.misnamed == 0, #R.misnamed > 0 and ("skipped: " .. table.concat(R.misnamed, ", ")) or "ok")
         warn("Delay Shot found on weapon tabs", (R.tabs.delay_shot or 0) > 0,
             (R.tabs.delay_shot or 0) > 0 and (R.tabs.delay_shot .. " tab(s)") or "only a global item or none: per-weapon Delay Shot may stay ON - check it in the menu")
         -- P2-11: видно ли твое значение hitchance, пока скрипт держит override (тогда adaptive / lag hc следуют за меню)
