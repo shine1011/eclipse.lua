@@ -2253,15 +2253,18 @@ do
         -- уверенность текущей стратегии: она не хуже ни одной другой больше чем на equal_margin, а все заметно
         -- худшие проигрывают ей с вероятностью >= confident_p. Почти равные стратегии (A ~ B) не мешают уверенности.
         local mc = ST.post(t.key, t.arm, t.wg, t.aat)
-        local pmin, beaten = 1, false
+        local pmin, beaten, cmp = 1, false, 0
         for a = 1, #ARMS do
             if a ~= t.arm and arm_ok(a) then
                 local ma = ST.post(t.key, a, t.wg, t.aat)
                 if ma > mc + c.equal_margin then beaten = true
-                elseif ma < mc - c.equal_margin then pmin = U.min(pmin, ST.p_better(t.key, t.arm, a, t.wg, t.aat)) end
+                elseif ma < mc - c.equal_margin then pmin = U.min(pmin, ST.p_better(t.key, t.arm, a, t.wg, t.aat)); cmp = cmp + 1 end
             end
         end
         t.pconf = beaten and 0 or pmin
+        -- v61: сравнивать было не с чем (все стратегии в пределах equal_margin) - pconf 1 означает "не хуже других",
+        -- а не "доказано лучше"; для вывода помечается отдельно
+        t.pcmp = beaten and 1 or cmp
         t.conf = mc
         t.samples = samples(t.key)
         if t.state == "RELEARNING" and t.relearn > 0 then  -- RELEARNING держится, пока не сделаны relearn_shots выстрелов
@@ -4738,8 +4741,9 @@ do
             for k = 1, math.min(3, #list) do parts[k] = string.format("%s %.0f%% (n %.0f)", P[list[k][1]].name, list[k][2] * 100, list[k][3]) end
             local cur = RAP.ai.cur[g]
             local xr, mode, conf = RAP.ai.explore_rate(g, pid)
-            print(string.format("[ai] %-5s dodge estimate top: %s | now: %s (%s, %.0f s) | %s, best-vs-2nd %.0f%%, explore %.0f%%", g,
-                table.concat(parts, ", "), cur and P[cur].name or "-", RAP.ai.how[g] or "-", math.min(999, RAP.ai.age(g)), mode, (conf or 0) * 100, xr * 100))
+            print(string.format("[ai] %-5s dodge estimate top: %s | now: %s (%s, %.0f s) | %s, best-vs-2nd %s, explore %.0f%%", g,
+                table.concat(parts, ", "), cur and P[cur].name or "-", RAP.ai.how[g] or "-", math.min(999, RAP.ai.age(g)), mode,
+                mode == "little data" and "-" or string.format("%.0f%%", (conf or 0) * 100), xr * 100))
             ::continue::
         end
         if RAP.ai.wc_now then print("[ai] current threat weapon class: " .. RAP.ai.wc_now .. (RAP.v("ai.per_weapon") and "" or " (per-weapon learning off)")) end
@@ -4824,8 +4828,13 @@ do
             local t, ST = c.st, RAP.strat
             -- v59: при малом числе своих выстрелов уверенность берется из приора (популяция) - так и пишется
             local prior_only = RAP.strat.own_ess(c.st.key, c.st.arm) < RAP.CFG.learn.min_ess
-            print(string.format("[why]  strategy: %s, %s, confidence %s (%s), %.0f samples%s", c.arm, c.state or "-", pc(c.strategy),
-                prior_only and "prior only - not enough own shots" or RAP.conf_level(c.strategy), c.samples, prior_only and " [estimate from other enemies]" or ""))
+            -- v61: "prior only" и "все стратегии равны" не печатаются как "confidence 100%"
+            local ctext = pc(c.strategy)
+            if prior_only then ctext = "-"
+            elseif t.pcmp == 0 then ctext = "-" end
+            print(string.format("[why]  strategy: %s, %s, confidence %s (%s), %.0f samples%s", c.arm, c.state or "-", ctext,
+                prior_only and "prior only - not enough own shots" or (t.pcmp == 0 and string.format("all strategies within %.0f%% - no difference yet", RAP.CFG.strategy.equal_margin * 100)
+                    or RAP.conf_level(c.strategy)), c.samples, prior_only and " [estimate from other enemies]" or ""))
             print(string.format("[why]    why: %s | next: %s", tostring(c.why or "-"), tostring(c.next or "-")))
             local mc = ST.post(t.key, t.arm, t.wg, t.aat)
             local rej = {}
@@ -4843,7 +4852,7 @@ do
             local AI = RAP.ai
             print(string.format("[why]  your AA [%s]: %s (%s, %.0f s), dodge estimate %s over %.1f own effective samples%s, best-vs-2nd %s (%s), explore %s",
                 c.group, c.profile, c.how or "-", U.min(999, c.age or 0), pc(c.dodge), c.events,
-                c.events < RAP.CFG.learn.min_ess and " [prior only]" or "", pc(c.aa_conf), c.aa_mode or "-", pc(c.explore)))
+                c.events < RAP.CFG.learn.min_ess and " [prior only]" or "", c.aa_mode == "little data" and "-" or pc(c.aa_conf), c.aa_mode or "-", pc(c.explore)))
             local rej = {}
             for _, i in ipairs(AI.pool(c.group)) do
                 if i ~= c.pidx then local m, _, n = AI.post(c.group, i, c.pid); rej[#rej + 1] = { RAP.profiles.list[i].name, m, n } end
@@ -7244,8 +7253,11 @@ do
             title, #rows - skipped, skipped, mb * 100))
         for _, it in ipairs(list) do
             local x = it[2]
-            print(string.format("[replay]   %-16s DR %4.0f%%  SNIPS %4.0f%%  +/-%3.0f  ess %5.1f  n %4d%s", tostring(names(it[1])), x.dr * 100, x.snips * 100,
-                1.96 * x.se * 100, x.ess, x.n, x.dg > 0 and string.format("  (%.0f%% in dangerous context)", x.dg * 100) or ""))
+            -- v61: при ess < 3 разброс по 1-2 выстрелам ничего не значит (было "+/- 0"): интервал не печатается;
+            -- DR-lite (базовая линия + IPS преимущества) может выйти за 0..100% - показывается в пределах
+            local few = x.ess < 3
+            print(string.format("[replay]   %-16s DR %4.0f%%  SNIPS %4.0f%%  %s  ess %5.1f  n %4d%s", tostring(names(it[1])), U.clamp(x.dr, 0, 1) * 100, x.snips * 100,
+                few and "+/- n/a (too few)" or string.format("+/-%3.0f", 1.96 * x.se * 100), x.ess, x.n, x.dg > 0 and string.format("  (%.0f%% in dangerous context)", x.dg * 100) or ""))
         end
         if #list == 0 then print("[replay]   no rows with logged propensity yet - play with v60+") end
         return est

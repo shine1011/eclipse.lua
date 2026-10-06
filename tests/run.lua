@@ -786,6 +786,7 @@ test("learn: console commands calib / replay / decisions log / attr run on mixed
     RAP.tele.ajournal.rows = { { p = 9, pr = 1, o = 1, b = 0.5, aw = 1, w0 = 1, dg = 1 } }
     E.console("/eclipse calib"); E.console("/eclipse replay"); E.console("/eclipse replay legacy"); E.console("/eclipse decisions log 5"); E.console("/eclipse attr")
     assert(has_line(E, "1 skipped") and has_line(E, "DR"), "OPE output")
+    assert(has_line(E, "n/a %(too few%)"), "1-2 rows must not print an interval")
     local rows = {}
     for i = 1, 60 do rows[i] = { an = (i % 3) + 1, pr = 0.9, r = (i % 3 == 0 and i % 2 == 0) and "correction" or ((i % 5 == 0) and "spread" or "hit") } end
     RAP.tele.journal.rows = rows
