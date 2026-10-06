@@ -2068,16 +2068,19 @@ do
         end
         return best or 1
     end
-    local function thompson(key, wg, aat)
-        local best, bv = 1, -1e9
-        for a = 1, #ARMS do
-            if arm_ok(a) and not RAP.dl.blocked("strat", key, a) then
-                local m, v = ST.post(key, a, wg, aat)
-                local s = m + U.randn() * U.sqrt(v)
-                if s > bv then best, bv = a, s end
-            end
-        end
-        return best
+    -- v60: эксперимент - РАВНОМЕРНО из остальных допустимых стратегий (было Thompson sampling - его вероятность выбора
+    -- не вычисляется). Возвращает стратегию и число вариантов K: propensity эксперимента = ex / K.
+    local function explore_pick(key, cur)
+        local list = {}
+        for a = 1, #ARMS do if a ~= cur and arm_ok(a) and not RAP.dl.blocked("strat", key, a) then list[#list + 1] = a end end
+        if #list == 0 then return nil, 0 end
+        return list[U.rand(1, #list)], #list
+    end
+    local function n_arms() local n = 0; for a = 1, #ARMS do if arm_ok(a) then n = n + 1 end end; return n end
+    -- решение по цели -> журнал решений (RAP.learn) с вероятностью выбора; t.prop / t.did уходят в выстрелы
+    local function decided(t, p, why, verify)
+        t.prop = p
+        t.did = RAP.learn.decide("strat", t.key, n_arms(), t.arm, p, why, verify)
     end
 
     -- машина состояний решения по цели: UNKNOWN -> PROBING -> CONFIDENT -> FAILED -> RELEARNING -> PROBING ...
@@ -2124,7 +2127,10 @@ do
         if not RAP.v("st.on") or not en or not en.pid or not RAP.W.learn(en.pid) then return nil end
         local key, wg, aat = ctx_of(en)
         local t = ST.T[en.idx]
-        if t and t.key == key and not arm_ok(t.arm) then t.arm, t.n, t.why, t.switched = best_arm(key, wg, aat), 0, "strategy disabled in CFG", true end
+        if t and t.key == key and not arm_ok(t.arm) then
+            t.arm, t.n, t.why, t.switched = best_arm(key, wg, aat), 0, "strategy disabled in CFG", true
+            decided(t, 1, "forced: strategy disabled in CFG", false)
+        end
         if not t or t.key ~= key then
             local tc = RAP.TC[en.idx]
             local changed = t and t.pid == en.pid and t.wg == wg and t.aat ~= aat and t.aat ~= "unknown" and aat ~= "unknown"
@@ -2133,17 +2139,23 @@ do
                 why = changed and "enemy AA changed" or "best estimate", state = changed and "RELEARNING" or "UNKNOWN",
                 relearn = changed and C().relearn_shots or 0 }
             ST.T[en.idx] = t
+            decided(t, 1, t.why, false)
             evaluate(t)
             if changed and RAP.v("st.logs") then U.log("strategy", "%s: enemy AA changed -> relearning", key) end
         end
         return t
     end
-    local function switch(t, arm, why)
+    -- p - вероятность выбора новой стратегии (1 - детерминированная смена); эксперимент не проверяется "до / после"
+    local function switch(t, arm, why, p)
         if arm == t.arm then return end
         local old = t.arm
         local pm, pv = ST.post(t.key, old, t.wg, t.aat)
-        RAP.dl.record("strat", t.key, old, arm, why, { conf = ST.p_better(t.key, arm, old, t.wg, t.aat), pre_m = pm, pre_v = pv, lf = ARMS[old], lt = ARMS[arm] })
+        local verify = why ~= "exploration"
+        if verify then
+            RAP.dl.record("strat", t.key, old, arm, why, { conf = ST.p_better(t.key, arm, old, t.wg, t.aat), pre_m = pm, pre_v = pv, lf = ARMS[old], lt = ARMS[arm] })
+        end
         t.arm, t.n, t.why, t.switched = arm, 0, why, true
+        decided(t, p or 1, why, verify)
         if RAP.v("st.logs") then
             local m = ST.post(t.key, arm, t.wg, t.aat)
             U.log("strategy", "%s [%s]: %s -> %s (%s, estimate %.0f%%)", t.key, t.state, ARMS[old], ARMS[arm], why, m * 100)
@@ -2294,7 +2306,8 @@ do
             if was == "CONFIDENT" then
                 -- уверенная стратегия провалилась: старый опыт по этому врагу ослабляется, больше экспериментов
                 t.state, t.relearn = "FAILED", c.relearn_shots
-                for a = 1, #ARMS do en.arms[a].h, en.arms[a].m = en.arms[a].h * 0.5, en.arms[a].m * 0.5 end
+                -- v60: ослабляются и vh / vm (по ним с v58 принимаются решения) - раньше только старые h / m
+                for a = 1, #ARMS do local x2 = en.arms[a]; x2.h, x2.m, x2.vh, x2.vm, x2.vw2 = x2.h * 0.5, x2.m * 0.5, x2.vh * 0.5, x2.vm * 0.5, x2.vw2 * 0.25 end
                 switch(t, alt, string.format("confident strategy failed (%d misses)", t.streak))
                 t.state = "RELEARNING"
             else
@@ -2307,9 +2320,16 @@ do
         else
             local ex = (was == "CONFIDENT") and c.explore_confident or c.explore_probing
             t.cool = (t.cool or 0) - 1
-            if t.cool <= 0 and U.rand(1, 1000) <= ex * 1000 then
-                local th = thompson(key, t.wg, t.aat)
-                if th ~= t.arm then switch(t, th, "exploration"); t.cool = c.explore_cooldown end
+            if t.cool <= 0 then
+                -- рандомизированное решение: эксперимент с вероятностью ex (равномерно из K других), иначе остаемся
+                local th, k = explore_pick(key, t.arm)
+                if th and U.rand(1, 100000) <= ex * 100000 then
+                    switch(t, th, "exploration", ex / k); t.cool = c.explore_cooldown
+                else
+                    decided(t, th and (1 - ex) or 1, "keep", false)
+                end
+            elseif t.prop ~= 1 then
+                decided(t, 1, "keep (exploration cooldown)", false)
             end
         end
         evaluate(t)
@@ -2506,7 +2526,7 @@ do
             -- стратегия (Strategy AI)
             local t = RAP.strat.for_target(en)
             local arm = t and t.arm or 1
-            RAP.strat.applied = t and arm or nil
+            RAP.strat.applied, RAP.strat.applied_t = t and arm or nil, t
             if arm == 2 then
                 local mph = RAP.v("rage.mph_" .. wg) or 0
                 RAP.vote("mp_head", U.min(100, mph > 0 and mph + 25 or 85), 30, "strategy: head focus")
@@ -2546,7 +2566,7 @@ do
             V.aat, V.mode, V.why = RAP.aat.type(idx), t and RAP.strat.ARMS[t.arm] or nil, t and t.why or nil
             V.conf = t and select(1, RAP.strat.post(t.key, t.arm, t.wg, t.aat)) or nil
         else
-            RAP.strat.applied = nil
+            RAP.strat.applied, RAP.strat.applied_t = nil, nil
             V.aat, V.mode, V.why, V.conf, V.head_why = nil, nil, nil, nil, nil
         end
         if RAP.v("rage.dmg_on") and RAP.v("rage.dmg_key") then RAP.vote("min_damage", RAP.v("rage.dmg_val") or 10, 70, "damage key") end
@@ -3624,30 +3644,42 @@ do
         return cap * 0.4, "uncertain", conf
     end
     -- выбор профиля: второй результат - как выбран ("evo" испытание, "explore" эксперимент, "best" лучшая оценка)
-    function AI.pick(g, exclude)
+    -- v60: эксперимент - РАВНОМЕРНЫЙ выбор из допустимых профилей (было Thompson sampling: его вероятность выбора
+    -- не вычисляется, а без нее нельзя честно сравнивать профили по журналу - OPE). Третий результат - propensity:
+    -- P(выбран этот профиль) = (1 - xp) * [это det] + xp / K, det - детерминированный выбор (по умолчанию лучший).
+    local function candidates(g, exclude)
+        local list = {}
+        for _, i in ipairs(pool(g)) do if i ~= exclude and not RAP.dl.blocked("aa", g, i) then list[#list + 1] = i end end
+        return list
+    end
+    function AI.pick(g, exclude, det)
         local f = RAP.evo and RAP.evo.force(g, exclude, true)
-        if f then return f, "evo" end
+        if f then return f, "evo", 1 end
         local pid = RAP.W.threat and RAP.W.pid(RAP.W.threat)
         local xp = AI.explore_rate(g, pid)
-        if U.rand(1, 1000) <= xp * 1000 then
-            local best, bv = nil, -1e9
-            for _, i in ipairs(pool(g)) do
-                if i ~= exclude and not RAP.dl.blocked("aa", g, i) then
-                    local m, v = AI.post(g, i, pid)
-                    local smp = m + U.randn() * U.sqrt(v)
-                    if smp > bv then best, bv = i, smp end
-                end
-            end
-            if best then return best, "explore" end
+        det = det or AI.best(g, exclude, pid)
+        local list = candidates(g, exclude)
+        local k = #list
+        if k > 0 and U.rand(1, 100000) <= xp * 100000 then
+            local c = list[U.rand(1, k)]
+            return c, (c == det) and "best" or "explore", (1 - xp) * (c == det and 1 or 0) + xp / k
         end
-        return AI.best(g, exclude, pid), "best"
+        return det, "best", (1 - xp) + ((k > 0 and U.has(list, det)) and xp / k or 0)
     end
     -- установка профиля группы: время включения нужно для минимального срока жизни и кулдауна
     AI.how = {}
-    local NOT_VERIFIED = { ["back to best"] = true, ["removed from pool"] = true, exploration = true, ["evo trial"] = true }
-    function AI.set(g, i, how, why)
+    local NOT_VERIFIED = { ["back to best"] = true, ["removed from pool"] = true, exploration = true, ["evo trial"] = true, keep = true }
+    -- p: propensity выбора (1 - детерминированное решение: panic / уверенная смена / откат / вынужденная замена)
+    AI.prop, AI.did = {}, {}
+    function AI.set(g, i, how, why, p)
         local old = AI.cur[g]
         AI.cur[g], AI.how[g] = i, how or "best"
+        p = p or 1
+        -- v60: КАЖДОЕ решение (и эксперимент, и испытание Evo) - в журнал решений с вероятностью выбора; вердикт
+        -- "до / после" по-прежнему только для настоящих решений (verify)
+        local verify = old ~= nil and old ~= i and why ~= nil and NOT_VERIFIED[why] == nil and how ~= "evo" and how ~= "explore"
+        AI.prop[g] = p
+        AI.did[g] = RAP.learn.decide("aa", g, #pool(g), i, p, how == "explore" and "explore" or (how == "evo" and "evo trial" or (why or how or "best")), verify)
         if old ~= i then
             local now = globals.curtime
             AI.since[g] = now
@@ -3673,10 +3705,10 @@ do
                 AI.pool_chk[g] = now
                 local ok = false
                 for _, i in ipairs(pool(g)) do if i == cur then ok = true; break end end
-                if not ok then local i, how = AI.pick(g, cur); AI.set(g, i, how, "removed from pool") end
+                if not ok then local i, how, p = AI.pick(g, cur); AI.set(g, i, how, "removed from pool", p) end
             end
         else
-            local i, how = AI.pick(g); AI.set(g, i, how)
+            local i, how, p = AI.pick(g); AI.set(g, i, how, nil, p)
         end
         return AI.cur[g]
     end
@@ -3881,18 +3913,24 @@ do
     -- новый кандидат лучше на HYST и с вероятностью >= 75% (без дерганья между почти равными профилями).
     RAP.on("round", "ai", function()
         local pid = RAP.W.threat and RAP.W.pid(RAP.W.threat)
+        -- v60: политика начала раунда явно: det = текущий (если он "лучший" и новый кандидат не уверенно лучше) или
+        -- лучший; с вероятностью xp - равномерный эксперимент. Propensity выбранного записывается (AI.set).
         for _, g in ipairs(GROUPS) do
             local cur = AI.cur[g]
-            local cand, how = AI.pick(g)
-            if not cur or how ~= "best" or AI.how[g] ~= "best" then
-                AI.set(g, cand, how, how == "explore" and "exploration" or (how == "evo" and "evo trial" or "back to best"))
-            elseif cand ~= cur then
-                local mc, vc = AI.post(g, cur, pid)
-                local mn, vn = AI.post(g, cand, pid)
-                if RAP.switch_ok(mn, vn, mc, vc, AI.p_better(g, cand, cur, pid), 0.75, 0.08) then
-                    AI.set(g, cand, "best", string.format("round start: %.0f%% vs %.0f%%", mn * 100, mc * 100))
+            local best = AI.best(g, nil, pid)
+            local det, why = best, "back to best"
+            if cur and AI.how[g] == "best" then
+                det, why = cur, "keep"
+                if best ~= cur then
+                    local mc, vc = AI.post(g, cur, pid)
+                    local mn, vn = AI.post(g, best, pid)
+                    if RAP.switch_ok(mn, vn, mc, vc, AI.p_better(g, best, cur, pid), 0.75, 0.08) then
+                        det, why = best, string.format("round start: %.0f%% vs %.0f%%", mn * 100, mc * 100)
+                    end
                 end
             end
+            local i, how, p = AI.pick(g, nil, det)
+            AI.set(g, i, how, how == "explore" and "exploration" or (how == "evo" and "evo trial" or why), p)
         end
     end)
     -- самые свежие враги (по AI.ets) из таблицы tbl, не больше cap; остальные удаляются и из памяти.

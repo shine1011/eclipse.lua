@@ -518,6 +518,26 @@ test("learn: enemy shot is attributed to the AA profile live at (t - latency), n
     no_errors(E)
 end)
 
+test("learn: AA exploration propensities match the empirical choice frequencies", function()
+    local E = S.load(PATH)
+    local AI = E.RAP.ai
+    AI.explore_rate = function() return 0.3 end
+    local freq, prop, n = {}, {}, 6000
+    for _ = 1, n do
+        local i, _, p = AI.pick("stand")
+        freq[i] = (freq[i] or 0) + 1
+        prop[i] = p
+    end
+    for i, c in pairs(freq) do
+        assert(math.abs(c / n - prop[i]) < 0.025, string.format("profile %d: freq %.3f vs logged p %.3f", i, c / n, prop[i]))
+    end
+    -- журнал решений получает decision_id и propensity
+    AI.set("stand", 10, "explore", "exploration", 0.05)
+    local L = E.RAP.learn
+    local d = L.dec[L.dec_n]
+    assert(d.sys == "aa" and d.ch == 10 and math.abs(d.p - 0.05) < 1e-9 and d.why == "explore" and d.verify == false)
+end)
+
 test("console_exec text is sanitized (trashtalk)", function()
     local E = S.load(PATH)
     local RAP = E.RAP
