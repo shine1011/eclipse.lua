@@ -427,7 +427,7 @@ test("head policy: lethal body (auto, 40 hp, armor) forces body; pistol at 40 hp
     local E2, RAP2, tick2 = rage_scene(2, { idx = 3, m_iHealth = 40, m_ArmorValue = 100, m_vecVelocity = vec(0, 0, 0) })
     for _ = 1, 4 do tick2() end
     local w2 = RAP2.arb.why.body_aim
-    assert(not (w2.value == "Force"), "pistol forced body at 40 hp with armor")
+    assert(w2.value ~= "Force", "pistol forced body at 40 hp with armor")
     no_errors(E); no_errors(E2)
 end)
 
